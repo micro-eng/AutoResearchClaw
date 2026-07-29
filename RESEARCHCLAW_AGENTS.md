@@ -22,11 +22,32 @@ pip install -e .
 
 # Configure (copy and edit)
 cp config.researchclaw.example.yaml config.yaml
+# Or for local Ollama:
+# cp config.ollama.example.yaml config.yaml
 # Set llm.base_url, llm.api_key, experiment.mode
 
 # Run
 researchclaw run --topic "Your topic" --auto-approve
 ```
+
+### Local Ollama
+
+```bash
+ollama serve && ollama pull qwen2.5:32b
+cp config.ollama.example.yaml config.arc.yaml
+export OPENAI_API_KEY=ollama
+researchclaw run --config config.arc.yaml --topic "Your topic" --auto-approve
+```
+
+### OpenFang Hand
+
+```bash
+./scripts/install_openfang_hand.sh
+openfang hand activate researchclaw
+# Ask OpenFang: "Research <topic>"
+```
+
+See `docs/openfang-ollama.md` for the full local + agent workflow.
 
 ## Pipeline Stages (23 stages, 8 phases)
 
@@ -81,5 +102,7 @@ Three stages require approval (use `--auto-approve` for fully autonomous mode):
 ResearchClaw works with:
 - **Claude Code**: Load via `.claude/skills/researchclaw/SKILL.md`
 - **OpenClaw**: Read this `AGENTS.md` + `README.md` for bootstrapping
+- **OpenFang**: Install `openfang/hands/researchclaw/` via `./scripts/install_openfang_hand.sh` (Ollama-friendly)
 - **OpenCode**: Compatible skill format in `.claude/skills/`
 - **Standalone**: Direct CLI or Python API usage
+- **Local LLMs**: Any OpenAI-compatible endpoint — start from `config.ollama.example.yaml`

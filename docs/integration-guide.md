@@ -22,6 +22,7 @@ This guide is for humans who want to understand what's happening under the hood,
 12. [Python API](#12-python-api)
 13. [Troubleshooting](#13-troubleshooting)
 14. [FAQ](#14-faq)
+15. [Local Ollama + OpenFang](#15-local-ollama--openfang)
 
 ---
 
@@ -147,6 +148,22 @@ llm:
   api_key: "your-proxy-key"
   primary_model: "gpt-4o"    # Must be supported by your endpoint
 ```
+
+**Using local Ollama**:
+```bash
+cp config.ollama.example.yaml config.arc.yaml
+export OPENAI_API_KEY=ollama
+```
+```yaml
+llm:
+  provider: "openai-compatible"
+  base_url: "http://localhost:11434/v1"
+  wire_api: "chat_completions"
+  api_key_env: "OPENAI_API_KEY"
+  api_key: "ollama"
+  primary_model: "qwen2.5:32b"
+```
+See [Local Ollama + OpenFang](#15-local-ollama--openfang) and [`docs/openfang-ollama.md`](openfang-ollama.md).
 
 ### Research Settings
 
@@ -754,6 +771,17 @@ Provide `RESEARCHCLAW_AGENTS.md` (if generated locally) or `README.md` as contex
 
 The agent reads this file and knows how to install, configure, and run the pipeline. If the file is not present, the `README.md` and `.claude/skills/researchclaw/SKILL.md` provide sufficient context for any AI assistant to operate the pipeline.
 
+### OpenFang
+
+[OpenFang](https://openfang.sh) can orchestrate AutoResearchClaw via the bundled Hand at `openfang/hands/researchclaw/`:
+
+```bash
+./scripts/install_openfang_hand.sh
+openfang hand activate researchclaw
+```
+
+Point the Hand at your clone + Ollama model, then ask it to research a topic. Full steps: [`docs/openfang-ollama.md`](openfang-ollama.md).
+
 ---
 
 ## 12. Python API
@@ -860,7 +888,18 @@ This prints a human-readable summary: which stages passed, which failed, key met
 A: Depends on your model and topic complexity. A typical run with GPT-4o makes ~35-60 API calls across all 23 stages (paper drafting now uses 3 sequential calls for section-by-section writing). Expect roughly $3-12 per run. Simulated mode uses slightly fewer tokens since it doesn't generate real experiment code.
 
 **Q: Can I use a local LLM (Ollama, vLLM, etc.)?**
-A: Yes — any OpenAI-compatible endpoint works. Set `llm.base_url` to your local server (e.g., `http://localhost:11434/v1` for Ollama). Quality depends heavily on the model's capabilities.
+A: Yes — any OpenAI-compatible endpoint works. The fastest path is:
+
+```bash
+cp config.ollama.example.yaml config.arc.yaml
+export OPENAI_API_KEY=ollama
+researchclaw run --config config.arc.yaml --topic "..." --auto-approve
+```
+
+Set `llm.base_url` to your local server (e.g., `http://localhost:11434/v1` for Ollama — `/v1` is required). Quality depends heavily on the model's capabilities; 32B+ instruction/code models are recommended for full pipeline runs. See [`docs/openfang-ollama.md`](openfang-ollama.md).
+
+**Q: Can I orchestrate runs with OpenFang agents?**
+A: Yes. Install the bundled Hand (`./scripts/install_openfang_hand.sh`), activate it, and ask OpenFang to research a topic. The Hand configures Ollama-backed `config.arc.yaml` and runs the CLI. Details: [`docs/openfang-ollama.md`](openfang-ollama.md).
 
 **Q: Can I run only part of the pipeline?**
 A: Yes. Use `--from-stage STAGE_NAME` to start from any stage. The stage reads its inputs from previously generated artifacts, so the earlier stages must have completed at least once.
@@ -879,4 +918,16 @@ A: Not recommended — the pipeline builds on prior stages' outputs. Start a new
 
 ---
 
-*Last updated: March 2026 · AutoResearchClaw v0.3.1+*
+## 15. Local Ollama + OpenFang
+
+For a fully local LLM + agent-orchestrated workflow:
+
+1. Start Ollama and pull a model (`qwen2.5:32b` recommended).
+2. `cp config.ollama.example.yaml config.arc.yaml`
+3. Optionally install the OpenFang Hand: `./scripts/install_openfang_hand.sh`
+
+Step-by-step guide, Hand settings, and troubleshooting: **[`docs/openfang-ollama.md`](openfang-ollama.md)**.
+
+---
+
+*Last updated: July 2026 · AutoResearchClaw + OpenFang/Ollama local setup*

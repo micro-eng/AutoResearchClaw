@@ -23,13 +23,19 @@ Activate this skill when the user:
 
 1. Verify config file exists:
    ```bash
-   ls config.yaml || ls config.researchclaw.example.yaml
+   ls config.arc.yaml || ls config.yaml || ls config.ollama.example.yaml || ls config.researchclaw.example.yaml
    ```
-2. If no `config.yaml`, create one from the example:
+2. If no project config, create one:
    ```bash
+   # Local Ollama:
+   cp config.ollama.example.yaml config.arc.yaml
+   # Or cloud / other OpenAI-compatible APIs:
    cp config.researchclaw.example.yaml config.yaml
    ```
-3. Ensure the user's LLM API key is configured in `config.yaml` under `llm.api_key` or via `llm.api_key_env` environment variable.
+3. Ensure the LLM is configured:
+   - Cloud: `llm.api_key` or `llm.api_key_env`
+   - Ollama: `llm.base_url: http://localhost:11434/v1` and `export OPENAI_API_KEY=ollama`
+4. OpenFang users: install the Hand with `./scripts/install_openfang_hand.sh` (see `docs/openfang-ollama.md`).
 
 ### Running the Pipeline
 
@@ -119,9 +125,10 @@ artifacts/<run-id>/
 ### Troubleshooting
 
 - **Config validation error**: Run `researchclaw validate --config config.yaml`
-- **LLM connection failure**: Check `llm.base_url` and API key
+- **LLM connection failure**: Check `llm.base_url` and API key (Ollama: `http://localhost:11434/v1` + `OPENAI_API_KEY=ollama`)
 - **Sandbox execution failure**: Verify `experiment.sandbox.python_path` exists and has numpy installed
 - **Gate rejection**: Use `--auto-approve` or manually approve at stages 5, 9, 20
+- **Local / OpenFang setup**: See `docs/openfang-ollama.md`
 
 ## Tools Required
 

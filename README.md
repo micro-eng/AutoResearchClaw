@@ -132,6 +132,7 @@ researchclaw setup
 # 3. Configure
 researchclaw init          # Interactive: choose LLM provider, creates config.arc.yaml
 # Or manually: cp config.researchclaw.example.yaml config.arc.yaml
+# Local Ollama:     cp config.ollama.example.yaml config.arc.yaml
 
 # 4. Run
 export OPENAI_API_KEY="sk-..."
@@ -139,6 +140,20 @@ researchclaw run --config config.arc.yaml --topic "Your research idea" --auto-ap
 ```
 
 Output → `artifacts/rc-YYYYMMDD-HHMMSS-<hash>/deliverables/` — compile-ready LaTeX, BibTeX, experiment code, charts.
+
+<details>
+<summary>🖥️ Local Ollama (no cloud LLM key)</summary>
+
+```bash
+ollama serve && ollama pull qwen2.5:32b
+cp config.ollama.example.yaml config.arc.yaml
+export OPENAI_API_KEY=ollama
+researchclaw run --config config.arc.yaml --topic "Your research idea" --auto-approve
+```
+
+Full guide (including OpenFang Hand install): **[docs/openfang-ollama.md](docs/openfang-ollama.md)**
+
+</details>
 
 <details>
 <summary>📝 Minimum required config</summary>
@@ -261,11 +276,26 @@ llm:
 researchclaw run --config config.yaml --topic "Your research idea" --auto-approve
 ```
 
+### 🦊 OpenFang + Ollama (Local Agents)
+
+Use [OpenFang](https://openfang.sh) Hands to orchestrate AutoResearchClaw while Ollama serves the LLM:
+
+```bash
+./scripts/install_openfang_hand.sh
+openfang hand activate researchclaw
+openfang hand config researchclaw --set repo_path="$(pwd)" --set primary_model="qwen2.5:32b"
+# Then: "Research <topic>" in the OpenFang dashboard
+```
+
+Hand package: `openfang/hands/researchclaw/` · Guide: **[docs/openfang-ollama.md](docs/openfang-ollama.md)**
+
 ### 🛠️ Other Ways to Run
 
 | Method | How |
 |--------|-----|
 | **Standalone CLI** | `researchclaw run --topic "..." --auto-approve` (autonomous) or `--mode co-pilot` (collaborative) |
+| **Local Ollama** | `cp config.ollama.example.yaml config.arc.yaml` → see [docs/openfang-ollama.md](docs/openfang-ollama.md) |
+| **OpenFang Hand** | `./scripts/install_openfang_hand.sh` then chat *"Research …"* |
 | **Python API** | `from researchclaw.pipeline import Runner; Runner(config).run()` |
 | **Claude Code** | Reads `RESEARCHCLAW_CLAUDE.md` — just say *"Run research on [topic]"* |
 | **Copilot CLI** | `researchclaw run --topic "..."` with `llm.acp.agent: "gh"` |
