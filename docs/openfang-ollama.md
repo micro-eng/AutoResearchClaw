@@ -85,6 +85,8 @@ The example disables OpenCode beast mode and Gemini Nano Banana so the stack sta
 
 ## 4. Run standalone (no OpenFang)
 
+### CLI
+
 ```bash
 export OPENAI_API_KEY=ollama
 researchclaw run --config config.arc.yaml \
@@ -99,6 +101,19 @@ Resume after interruption:
 ```bash
 researchclaw run --config config.arc.yaml --resume
 ```
+
+### Web console
+
+The repo ships a local UI under `frontend/` (served by FastAPI):
+
+```bash
+# needs: pip install fastapi uvicorn
+export OPENAI_API_KEY=ollama
+researchclaw serve --config config.arc.yaml --host 127.0.0.1 --port 8080
+# open http://127.0.0.1:8080
+```
+
+From the console you can start/stop runs, watch status, and browse recent `artifacts/rc-*` runs. Health check: `GET /api/health`.
 
 ## 5. Run with OpenFang
 

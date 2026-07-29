@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ResearchClaw — Local Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="bg"></div>
+  <header class="top">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <div>
+        <h1>ResearchClaw</h1>
+        <p class="tag">Local console · Ollama backend</p>
+      </div>
+    </div>
+    <div class="status-pills">
+      <span id="healthPill" class="pill">API …</span>
+      <span id="llmPill" class="pill">LLM …</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel launch">
+      <h2>Run research</h2>
+      <p class="hint">Starts the 23-stage pipeline against your configured local model.</p>
+      <label for="topic">Topic</label>
+      <textarea id="topic" rows="3" placeholder="e.g. Sparse attention for efficient transformers"></textarea>
+      <div class="row">
+        <label class="check"><input type="checkbox" id="autoApprove" checked /> Auto-approve gates</label>
+        <button id="startBtn" type="button">Start pipeline</button>
+        <button id="stopBtn" type="button" class="ghost" disabled>Stop</button>
+      </div>
+      <pre id="actionLog" class="log" aria-live="polite"></pre>
+    </section>
+
+    <section class="panel">
+      <h2>Live status</h2>
+      <dl id="statusBox" class="kv">
+        <div><dt>Status</dt><dd id="runStatus">idle</dd></div>
+        <div><dt>Run ID</dt><dd id="runId">—</dd></div>
+        <div><dt>Topic</dt><dd id="runTopic">—</dd></div>
+        <div><dt>Output</dt><dd id="runOut">—</dd></div>
+      </dl>
+      <h3>Config</h3>
+      <pre id="configBox" class="log compact">Loading…</pre>
+    </section>
+
+    <section class="panel wide">
+      <h2>Pipeline stages</h2>
+      <div id="stages" class="stages"></div>
+    </section>
+
+    <section class="panel wide">
+      <h2>Recent runs</h2>
+      <ul id="runs" class="runs"></ul>
+    </section>
+  </main>
+
+  <footer>
+    <span>Artifacts land in <code>artifacts/rc-*/</code></span>
+    <a href="/api/health" target="_blank" rel="noreferrer">/api/health</a>
+  </footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>

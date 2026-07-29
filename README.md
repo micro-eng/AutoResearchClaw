@@ -151,6 +151,14 @@ export OPENAI_API_KEY=ollama
 researchclaw run --config config.arc.yaml --topic "Your research idea" --auto-approve
 ```
 
+Web console (same Ollama config):
+
+```bash
+pip install fastapi uvicorn   # if needed
+researchclaw serve --config config.arc.yaml --host 127.0.0.1 --port 8080
+# → http://127.0.0.1:8080
+```
+
 Full guide (including OpenFang Hand install): **[docs/openfang-ollama.md](docs/openfang-ollama.md)**
 
 </details>
