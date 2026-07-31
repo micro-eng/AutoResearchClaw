@@ -1,0 +1,36 @@
+diff --git a/researchclaw/pipeline/experiment_diagnosis.py b/researchclaw/pipeline/experiment_diagnosis.py
+index c6b3e79..062d390 100644
+--- a/researchclaw/pipeline/experiment_diagnosis.py
++++ b/researchclaw/pipeline/experiment_diagnosis.py
+@@ -448,9 +448,9 @@ def _check_synthetic_data(diag: ExperimentDiagnosis, output: str) -> None:
+                 description="Experiment fell back to synthetic/random data instead of real dataset.",
+                 error_message=_extract_context(output, pat),
+                 suggested_fix=(
+-                    "Fix dataset loading. Use a pre-cached dataset "
+-                    "(CIFAR-10/MNIST are available at /opt/datasets). "
+-                    "Ensure download happens in setup.py, not main.py."
++                    "Fix dataset loading. Load the EXACT dataset named in the "
++                    "experiment plan / prompt. Never fall back to synthetic data "
++                    "and never substitute a dataset from an unrelated domain."
+                 ),
+             ))
+             break
+@@ -472,11 +472,13 @@ def _check_dataset_issues(diag: ExperimentDiagnosis, output: str) -> None:
+                 description=desc,
+                 error_message=_extract_context(output, pat),
+                 suggested_fix=(
+-                    "The dataset does not exist on HuggingFace Hub. "
+-                    "Use ONLY pre-cached datasets: CIFAR-10, CIFAR-100, MNIST, "
+-                    "FashionMNIST, STL-10 (available at /opt/datasets). "
+-                    "Remove the failing download from setup.py and use "
+-                    "torchvision.datasets with root='/opt/datasets' instead."
++                    "The dataset path in the code does not exist. Use the EXACT "
++                    "dataset path given in the experiment plan / prompt — do not "
++                    "invent a path and do not substitute a different dataset from "
++                    "another domain (e.g. do NOT switch a tabular or time-series "
++                    "study to torchvision/CIFAR). If the plan names a local file, "
++                    "load that file; if no path is available, fail loudly rather "
++                    "than falling back to synthetic or unrelated data."
+                 ),
+             ))
+ 

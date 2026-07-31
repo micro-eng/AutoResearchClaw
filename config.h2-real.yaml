@@ -1,0 +1,126 @@
+# AutoResearchClaw — WS3 H2 on REAL AEMO NEM data (fresh run, never --resume)
+#
+# Differences from config.arc.yaml (the failed rc-20260730-114801-e9b01a run):
+#   - prompts.custom_file points at prompts.h2-real.yaml, which replaces the two
+#     Docker-image dataset blocks that made the code agent invent
+#     /opt/datasets/electricity_prices.csv.
+#   - topic names the real CSV path and says "tabular" so domain detection lands on
+#     ml_tabular (an ML domain), which suppresses the physics_simulation adapter that
+#     told the previous run to "generate data programmatically".
+#   - time_budget_sec raised 300 -> 900: the analysis is cheap but there are ~85k rows,
+#     5 conditions and 10 bootstrap resamples.
+#   - matplotlib is now installed, so figure_agent can actually render.
+
+project:
+  name: "ws3-h2-real-nem"
+  mode: "full-auto"
+
+research:
+  topic: "Divergence-conditioned interval widening for probabilistic electricity price forecasting on tabular five-minute market data: does forecast-ensemble dispersion predict realised absolute error well enough to calibrate predictive intervals, measured by CRPS and 90 percent interval coverage against unconditional quantile aggregation, evaluated on 84,610 matched AEMO P5MIN forecast-vintage ensembles from the Australian National Electricity Market held at /Users/alexeynikitine/data/ws3_h2/ws3_h2_matched.csv, with a realised-volatility control feature and a time-ordered train/test split"
+  domains:
+    - "machine-learning"
+    - "energy"
+  daily_paper_count: 8
+  quality_threshold: 4.0
+
+runtime:
+  timezone: "Australia/Melbourne"
+  max_parallel_tasks: 2
+  approval_timeout_hours: 12
+  retry_limit: 2
+
+notifications:
+  channel: "console"
+  target: ""
+  on_stage_start: true
+  on_stage_fail: true
+  on_gate_required: true
+
+knowledge_base:
+  backend: "markdown"
+  root: "docs/kb"
+
+openclaw_bridge:
+  use_cron: false
+  use_message: false
+  use_memory: false
+  use_sessions_spawn: false
+  use_web_fetch: false
+  use_browser: false
+
+llm:
+  provider: "openai-compatible"
+  base_url: "http://localhost:11434/v1"
+  wire_api: "chat_completions"
+  api_key_env: "OPENAI_API_KEY"
+  api_key: "ollama"
+  primary_model: "qwen2.5:72b-instruct"
+  # 72B generates at ~6 tok/s; the 600s default caps a response at ~3.6k tokens while
+  # code_agent requests up to 16384. 3600s covers a full-length generation.
+  timeout_sec: 3600
+  # Fallback DISABLED deliberately: a silent swap to 32B mid-paper would give the
+  # deliverable mixed-model provenance, which is worse than a loud failure.
+  fallback_models: []
+
+security:
+  hitl_required_stages: [5, 9, 20]
+  allow_publish_without_approval: false
+  redact_sensitive_logs: true
+
+experiment:
+  mode: "sandbox"
+  time_budget_sec: 900
+  max_iterations: 6
+  metric_key: "primary_metric"
+  metric_direction: "minimize"
+  sandbox:
+    python_path: ".venv/bin/python3"
+    gpu_required: false
+    max_memory_mb: 4096
+  opencode:
+    enabled: false
+    auto: false
+    complexity_threshold: 0.5
+    model: ""
+    timeout_sec: 600
+    max_retries: 0
+    workspace_cleanup: true
+  figure_agent:
+    enabled: true
+    min_figures: 3
+    max_figures: 6
+    max_iterations: 2
+    render_timeout_sec: 120
+    docker_image: "researchclaw/experiment:latest"
+    output_format: "python"
+    nano_banana_enabled: false
+    gemini_model: "gemini-2.5-flash-image"
+    strict_mode: false
+    dpi: 300
+
+prompts:
+  custom_file: "prompts.h2-real.yaml"
+
+metaclaw_bridge:
+  enabled: false
+  proxy_url: "http://localhost:30000"
+  skills_dir: "~/.metaclaw/skills"
+  fallback_url: ""
+  fallback_api_key: ""
+  prm:
+    enabled: false
+    api_base: ""
+    api_key_env: "PRM_API_KEY"
+    api_key: ""
+    model: "gpt-5.4"
+    votes: 3
+    gate_stages: [5, 9, 15, 20]
+  lesson_to_skill:
+    enabled: false
+    min_severity: "error"
+    max_skills_per_run: 3
+
+export:
+  target_conference: "neurips_2025"
+  authors: "Anonymous"
+  bib_file: "references"

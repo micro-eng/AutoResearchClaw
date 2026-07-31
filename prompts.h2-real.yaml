@@ -1,0 +1,356 @@
+version: '1.0'
+blocks:
+  network_disabled_guidance: "\n## THE DATASET FOR THIS STUDY — REAL DATA, ALREADY ON LOCAL DISK\n\nIGNORE\
+    \ any other text in this prompt that mentions `/opt/datasets`, pre-cached\nCIFAR-10/CIFAR-100/MNIST/FashionMNIST/STL-10/SVHN,\
+    \ torchvision, HuggingFace, or\n\"Tier 1 datasets\". That text is boilerplate from a different deployment\
+    \ and is\nFALSE on this machine. There is no Docker image, no /opt/datasets directory, and\ntorchvision\
+    \ is NOT installed. This is a tabular time-series study; image datasets\nare irrelevant to it.\n\n\
+    There is exactly ONE dataset, it is real, it is already on disk, and it needs no\ndownload:\n\n  \
+    \  DATA_PATH = \"/Users/alexeynikitine/data/ws3_h2/ws3_h2_matched.csv\"\n\nLoad it with a plain `pandas.read_csv(DATA_PATH)`.\
+    \ Nothing else. No download, no\nnetwork, no setup.py, no requirements.txt, no HuggingFace, no duckdb.\n\
+    \n### Provenance\n678,735 rows of matched five-minute Australian NEM electricity market data, built\n\
+    from AEMO's live P5MIN pre-dispatch price forecasts joined to realised dispatch\nprices. All five\
+    \ NEM regions (NSW1, QLD1, SA1, TAS1, VIC1), 2026-05-29 17:35 to\n2026-07-31 01:25 NEM time (AEST,\
+    \ UTC+10, no DST). Zero nulls in every column.\n\n### Exact header line (verbatim — these are the\
+    \ ONLY columns that exist)\ninterval_datetime,regionid,horizon_min,n_vintages,ens_mean,ens_median,ens_sd,ens_min,ens_max,rrp_actual,price_status,totaldemand,rrp_last_obs,vol_lag,err,abs_err\n\
+    \n### Column semantics\n- `interval_datetime` (str) — the TARGET 5-minute dispatch interval being\
+    \ forecast.\n  Parse with `pd.to_datetime(df[\"interval_datetime\"])`.\n- `regionid` (str) — NSW1\
+    \ / QLD1 / SA1 / TAS1 / VIC1.\n- `horizon_min` (int) — forecast lead time in minutes, one of 0,5,10,15,20,25,30,35.\n\
+    \  The row's ensemble uses only forecast vintages published at or before\n  (interval_datetime - horizon_min).\n\
+    - `n_vintages` (int, 2..12) — number of ensemble members behind this row.\n- `ens_mean` (float) —\
+    \ ensemble mean forecast price, $/MWh. THIS IS THE POINT FORECAST.\n- `ens_median`, `ens_min`, `ens_max`\
+    \ (float) — other ensemble summaries.\n- `ens_sd` (float) — THIS IS D, the ensemble dispersion (sample\
+    \ stddev of the member\n  forecasts). IT IS ALREADY COMPUTED. Do NOT group by anything to build it.\n\
+    - `rrp_actual` (float) — the REALISED dispatch price, $/MWh. This is the target y.\n- `price_status`\
+    \ (str) — AEMO FIRM / NOT FIRM flag on the realised price.\n- `totaldemand` (float) — realised regional\
+    \ demand, MW (covariate).\n- `rrp_last_obs` (float) — last realised price observable at forecast time\n\
+    \  (leakage-free persistence anchor).\n- `vol_lag` (float) — realised price volatility over the 12\
+    \ dispatch intervals\n  strictly before forecast time. LEAKAGE-FREE RIVAL UNCERTAINTY FEATURE — this\
+    \ is the\n  control that D must beat.\n- `err` (float) — signed ens_mean - rrp_actual.\n- `abs_err`\
+    \ (float) — abs(ens_mean - rrp_actual). THIS IS THE REALISED ABSOLUTE ERROR\n  THE HYPOTHESIS IS ABOUT.\n\
+    \n### Row grain\nOne row = one (target interval x region x horizon_min) triple. NOT one row per\n\
+    ensemble member. No groupby is needed anywhere in the loader.\n\n### MANDATORY FILTERING — a reviewer\
+    \ will kill the paper without this\nThe `horizon_min == 0` slice contains a look-ahead contaminant:\
+    \ AEMO's horizon-0\nP5MIN vintage is quasi-truth (about 35 percent of those rows equal the realised\n\
+    price to within 0.005). It is retained in the file only for backward comparison.\nYour loader MUST\
+    \ drop it:\n\n    df = pd.read_csv(DATA_PATH)\n    df = df[(df[\"horizon_min\"] == 5) & (df[\"n_vintages\"\
+    ] >= 5)].copy()\n\nThat leaves about 84,610 clean rows across five regions. State the filter explicitly\n\
+    in the results so it can be reported in the paper.\n\n### MANDATORY SPLIT\nSplit train/test BY TIME\
+    \ on `interval_datetime` (e.g. first 70 percent of the sorted\nunique intervals as train, last 30\
+    \ percent as test). NEVER use a random split — these\nare overlapping-window forecasts and a random\
+    \ split leaks the target.\n\n### HEAVY TAILS\nRealised prices in this market range from about -757\
+    \ to +20,300 $/MWh. A MEAN CRPS is\ndominated by a handful of price spikes. For every condition, report\
+    \ BOTH the mean and\nthe median of the per-row CRPS, and make clear which one any comparison rests\
+    \ on.\n\n### CONDITIONS YOU MUST IMPLEMENT (not optional, not \"if time permits\")\nEvery one of these\
+    \ MUST appear in the code and MUST print metrics. Omitting any one of\nthem invalidates the comparison,\
+    \ because each exists to kill a specific confound:\n1. `UnconditionalQuantileAggregation` — constant-width\
+    \ intervals from the TRAIN residual\n   quantiles of ens_mean. The baseline.\n2. `DivergenceConditionedWidening`\
+    \ — intervals scaled by a gamma(D) fitted on a held-out\n   slice of TRAIN, never on test. Report\
+    \ the base it multiplies.\n3. `VolatilityConditionedWidening` — identical mechanism conditioned on\
+    \ `vol_lag`\n   instead of `ens_sd`. WITHOUT THIS CONDITION THE PAPER CANNOT DISTINGUISH \"dispersion\n\
+    \   carries signal\" FROM \"any volatility proxy carries signal\", which is the single most\n   likely\
+    \ reviewer objection. It is mandatory.\n4. `NormalizedConformal` — location-scale / split-conformal,\
+    \ half-width proportional to\n   a train-fitted scale s(D). A DIFFERENT family from the multiplier;\
+    \ report both.\n5. Ablation `AlphaZero` / `NoWidening` — no widening at all. NOTE: this is the SAME\n\
+    \   ESTIMATOR as condition 1 (alpha=0 leaves the unconditional intervals unchanged).\n   Implement\
+    \ it once and report it as ONE row carrying both names, e.g.\n   \"UnconditionalQuantileAggregation\
+    \ (= NoWidening, alpha=0)\". Do NOT present them as\n   two independent conditions with two separate\
+    \ numbers — they are one comparator, and\n   reporting them twice would imply a comparison that does\
+    \ not exist.\n6. Ablation `ShuffledD` — D randomly permuted across rows, destroying the D-error\n\
+    \   association. If this does NOT degrade relative to condition 2, the apparent effect is\n   an artefact\
+    \ and you must say so.\n\n### METRIC OUTPUT CONTRACT — the harness parser only recognises these exact\
+    \ forms\nMetrics are parsed from STDOUT by a strict regex. Printing a Python dict does NOT work:\n\
+    `print(f\"condition={name} seed={s} {metrics_dict}\")` produces `{'CRPS': 12.3}` and parses to\nNOTHING,\
+    \ leaving zero conditions and an unusable experiment. Print one metric per line, in\nexactly these\
+    \ forms:\n\n    condition=<ConditionName> seed=<k> <MetricName>: <float>\n    SUMMARY condition=<ConditionName>\
+    \ metric=<MetricName> mean=<float> std=<float>\n\ne.g. `condition=DivergenceConditionedWidening seed=3\
+    \ CRPS: 14.238`. Metric names must be bare\nidentifiers with no quotes and no braces. Also print a\
+    \ final `primary_metric: <float>` line.\n\nEVERY reported metric MUST be a SINGLE FLOAT, never a numpy\
+    \ array or a list. If a metric is\ncomputed per row, aggregate it (mean, and separately median) BEFORE\
+    \ reporting. Returning a\nper-row vector as the primary metric makes every downstream comparison meaningless.\n\
+    \nDo NOT report the same quantity twice under two names. If two metrics are computed by the\nsame\
+    \ expression, report one of them and drop the other — duplicates appear in a results\ntable as independent\
+    \ evidence when they are not.\n\nPINBALL LOSS — both branches are required, at the correct level.\
+    \ For a quantile q at level\ntau, the pinball loss of an outcome y is `tau*(y - q)` when `y >= q`\
+    \ and `(1 - tau)*(q - y)`\nwhen `y < q`. A formula that keeps only one branch per bound (for example\n\
+    `max(0, y - lower)*0.1 + max(0, upper - y)*0.9`) is NOT a pinball loss: it is minimised by\ndriving\
+    \ the interval toward a single point at the upper bound and it under-penalises\nexceedance of the\
+    \ upper bound by a factor of nine relative to the lower. Implement both\nbranches for every quantile\
+    \ level on the grid.\n\n### CRPS DEFINITION — a width is NOT a CRPS\nCRPS MUST be a function of the\
+    \ realised outcome y_true. An expression that uses only the\npredicted bounds, such as `(upper - lower)/2`,\
+    \ is an INTERVAL WIDTH, not a CRPS: minimising it\nrewards the narrowest possible intervals regardless\
+    \ of whether they contain the outcome, which\nsilently inverts the entire study. Compute CRPS over\
+    \ a quantile grid as\n`2 * mean over quantile levels tau of the pinball loss of (y_true, q_tau)`,\
+    \ where the pinball\nloss is `max(tau*(y_true - q_tau), (tau-1)*(y_true - q_tau))`. Use a grid of\
+    \ at least 19 levels\n(0.05 to 0.95), not just the two interval endpoints. If you instead report a\
+    \ mean pinball loss,\nlabel it \"mean pinball loss\" and never \"CRPS\". Print which convention you\
+    \ used.\n\n### CRPS DEFINITION\nCRPS equals TWICE the integral of the pinball loss over the quantile\
+    \ levels. If you\ncompute a mean pinball loss, either multiply by 2 or label the number \"mean pinball\n\
+    loss\" — never print a mean pinball loss under the name \"CRPS\". Print which convention\nyou used.\n\
+    \n### REPORT THE WIDTH EXPONENT, NOT JUST ALPHA (hard requirement)\nAn alpha value is meaningless\
+    \ unless the base it multiplies is stated, because the base\nmay already scale with D. The parameterisation-free\
+    \ quantity is the implied TOTAL\ninterval width exponent on D: the slope of log(interval width) against\
+    \ log(D). For every\ncondition that conditions on D, print that exponent, and print which base the\
+    \ alpha\nrefers to. Prefer the exponent over alpha when stating any result.\n\nAlso print, per D-decile,\
+    \ the multiplier that would have been CRPS-optimal for that\ndecile, and the Spearman correlation\
+    \ of those optimal multipliers against decile index.\nA negative correlation combined with a gamma(D)\
+    \ constrained non-decreasing in D means\nthe constraint binds and the best achievable gamma under\
+    \ that form is a constant. That\nis a real finding about the parameterisation and must be printed,\
+    \ not hidden.\n\n### THE DIRECTION OF THE RESULT IS NOT KNOWN\nDo not write code that assumes divergence-conditioned\
+    \ widening helps. A null or negative\nresult is a perfectly good outcome and must be reported as-is.\
+    \ The selected alpha may\nlegitimately come out as zero. Never tune on the test window to rescue a\
+    \ direction.\n\n### AVAILABLE PACKAGES (host Python, verified)\nnumpy 2.4, pandas 3.0, scipy 1.17,\
+    \ scikit-learn 1.9, matplotlib 3.11, pyarrow, torch 2.13\n(CPU/MPS), tqdm, plus the Python standard\
+    \ library.\nNOT AVAILABLE — importing any of these is an instant failure: torchvision, seaborn,\n\
+    statsmodels, duckdb, datasets, transformers, tensorflow, jax, lightgbm, catboost.\nNOTE: `xgboost`\
+    \ 3.2.0 IS now installed and MAY be used (`from xgboost import XGBRegressor`).\nFor a random-forest\
+    \ baseline use `sklearn.ensemble.RandomForestRegressor`. Use the\nREGRESSOR variants, never the Classifier\
+    \ variants — the target `rrp_actual` is a\ncontinuous price in $/MWh, not a class label. Better still:\
+    \ remember that this is an\nINTERVAL-CALIBRATION study, not a point-forecast-accuracy study — the\
+    \ point forecast\n`ens_mean` is GIVEN in the data and does not need to be re-learned. Do not spend\
+    \ the\ntime budget training regressors when the question is how wide the intervals should be.\n\n\
+    ### FORBIDDEN\n- Do NOT invent, guess, or construct any other dataset path. There is one path, above.\n\
+    - Do NOT generate synthetic or random predictors. The whole point of this study is that\n  the ensemble\
+    \ is real. `np.random.normal` as a data source is an instant failure.\n- Do NOT substitute an image/vision\
+    \ dataset. Do NOT import torchvision.\n- Do NOT write setup.py or requirements.txt. There is no network\
+    \ and no pip.\n- If the file cannot be read, PRINT THE ERROR AND EXIT NON-ZERO. Never fall back to\n\
+    \  synthetic data — a silent synthetic fallback is worse than a crash.\n"
+  dataset_guidance: "\n## THE DATASET FOR THIS STUDY — REAL DATA, ALREADY ON LOCAL DISK\n\nIGNORE any\
+    \ other text in this prompt that mentions `/opt/datasets`, pre-cached\nCIFAR-10/CIFAR-100/MNIST/FashionMNIST/STL-10/SVHN,\
+    \ torchvision, HuggingFace, or\n\"Tier 1 / pre-cached datasets\". That text is boilerplate from a\
+    \ different deployment\nand is FALSE on this machine. This is a tabular time-series study on real\
+    \ electricity\nmarket data. Image datasets are irrelevant and torchvision is not installed.\n\nUnder\
+    \ `datasets` in the experiment plan you MUST specify exactly this one dataset and\nthis exact path:\n\
+    \n    name: NEM_P5MIN_MatchedEnsemble\n    path: /Users/alexeynikitine/data/ws3_h2/ws3_h2_matched.csv\n\
+    \n678,735 rows of matched five-minute Australian NEM data built from AEMO P5MIN\npre-dispatch price\
+    \ forecasts joined to realised dispatch prices; five regions;\n2026-05-29 to 2026-07-31; zero nulls.\
+    \ Columns (the ONLY columns that exist):\n\ninterval_datetime, regionid, horizon_min, n_vintages,\
+    \ ens_mean, ens_median, ens_sd,\nens_min, ens_max, rrp_actual, price_status, totaldemand, rrp_last_obs,\
+    \ vol_lag, err,\nabs_err\n\nKey semantics: `ens_sd` IS the ensemble dispersion D (already computed,\
+    \ no groupby\nneeded); `abs_err` IS the realised absolute forecast error of `ens_mean` against the\n\
+    realised price `rrp_actual`; `vol_lag` is a leakage-free realised-volatility rival\nfeature that D\
+    \ must be shown to beat; `horizon_min` is forecast lead time in minutes.\n\nMANDATORY analysis constraints\
+    \ for the plan:\n- Restrict to `horizon_min == 5` and `n_vintages >= 5` (about 84,610 rows). The\n\
+    \  `horizon_min == 0` slice is contaminated by a quasi-truth vintage and must be dropped.\n- Split\
+    \ train/test BY TIME on interval_datetime. A random split leaks.\n- Regime factors to stratify by\
+    \ MUST come from real columns — use `regionid`\n  (five real regions) and a demand or volatility tercile\
+    \ derived from `totaldemand` or\n  `vol_lag`. Do NOT invent regime factors like \"noise_level: [low,\
+    \ high]\" that do not\n  exist in the data.\n\nConditions the plan should cover (this is a calibration\
+    \ study, not a model-training\nstudy — every condition is cheap, so use bootstrap resamples of the\
+    \ test window as the\nseed dimension rather than random weight initialisations):\n- `UnconditionalQuantileAggregation`\
+    \ — baseline. Predictive intervals from the TRAIN\n  residual quantiles of `ens_mean`, applied with\
+    \ constant width to every test row.\n- `DivergenceConditionedWidening` — the proposed method. Same\
+    \ intervals scaled by\n  gamma(D) = 1 + alpha * D_standardised, alpha selected on a held-out slice\
+    \ of the\n  TRAIN window (never on test). Report the selected alpha. alpha = 0 is a legitimate\n \
+    \ selected value and must be reported honestly if it wins.\n- `VolatilityConditionedWidening` — rival\
+    \ control. Identical mechanism but conditioned\n  on `vol_lag` instead of `ens_sd`. This is what separates\
+    \ \"dispersion carries signal\"\n  from \"any volatility proxy carries signal\".\n- `NormalizedConformal`\
+    \ — a location-scale / split-conformal condition in which the\n  interval half-width is proportional\
+    \ to a scale estimate s(D) fitted on the train\n  window, rather than a multiplicative widening applied\
+    \ on top of an already-fixed\n  width. This is a DIFFERENT family from the gamma(D) multiplier and\
+    \ can behave\n  differently; both must be reported.\n- Ablations: widening with alpha fixed at 0 (no\
+    \ widening); and widening conditioned on\n  a shuffled D (destroys the D-error association, must degrade\
+    \ if the mechanism is real).\n\nMetrics: primary `CRPS` (direction: minimize), secondary `Coverage90`\
+    \ (target 0.90),\n`Width90`, `PinballLoss`, and `success_rate`.\n\nHEAVY TAILS — prices in this market\
+    \ range from about -757 to +20,300 $/MWh, so a MEAN\nCRPS is dominated by a handful of price spikes.\
+    \ Report the MEDIAN CRPS alongside the\nmean for every condition, and say which one a given claim\
+    \ rests on.\n\nREPORT THE WIDTH EXPONENT, NOT JUST ALPHA (this is a hard requirement). The value of\n\
+    alpha is meaningless unless the base it multiplies is stated, because the base may\nitself already\
+    \ scale with D. Two correct analyses of this same dataset produced\nopposite-signed optimal alphas\
+    \ purely because one multiplied the aggregated ensemble\nquantile function (already proportional to\
+    \ D) and the other multiplied residual\nquantiles about the ensemble mean (not proportional to D).\
+    \ The parameterisation-free\nquantity is the implied TOTAL interval width exponent on D, i.e. the\
+    \ slope of\nlog(interval width) against log(D). Compute and report it for every conditioned\ncondition,\
+    \ state explicitly which base each alpha refers to, and prefer the exponent\nover alpha whenever making\
+    \ a claim.\n\nALSO REQUIRED: report, per D-decile, the multiplier that would have been CRPS-optimal\n\
+    for that decile, and the Spearman correlation of that optimal multiplier against the\ndecile index.\
+    \ If that correlation is negative while the method's own gamma(D) is\nconstrained to be non-decreasing\
+    \ in D, then the constraint binds and the maximum gain\nachievable under that parameterisation is\
+    \ zero — which is a real and reportable finding\nabout the parameterisation, not a failure of the\
+    \ experiment.\n\nCRPS DEFINITION — be explicit. CRPS equals TWICE the integral of the pinball loss\
+    \ over\nthe quantile levels. If you report a mean pinball loss, label it \"mean pinball loss\",\n\
+    not \"CRPS\". State in the output which convention you used.\n\nDIRECTION OF THE RESULT IS NOT KNOWN\
+    \ AND MUST NOT BE ASSUMED. A negative or null result\n— gamma(D) failing to beat unconditional aggregation\
+    \ on CRPS — is a perfectly good and\npublishable outcome here, and the selected alpha may legitimately\
+    \ be zero or negative.\nDo not design the experiment to confirm a direction, and do not describe an\
+    \ outcome as\nexpected. Report what the numbers say.\n\nCompute: this is numpy/pandas/sklearn arithmetic\
+    \ over ~85k rows. Every condition runs\nin seconds. Prefer MORE bootstrap resamples (10) over fewer.\n"
+  topic_constraint: "\n\n=== HARD TOPIC CONSTRAINT ===\nThe paper MUST be about: {topic}\n\nPROHIBITED\
+    \ content:\n- Do NOT treat environment setup, dependency installation, or infrastructure failures\n\
+    \  as a research contribution.\n- Do NOT present debugging logs, system errors, or configuration issues\
+    \ as findings.\n- Do NOT drift to tangential topics.\n- Every section MUST connect back to the core\
+    \ research question.\n- The Method section MUST describe a technical approach, not a workflow.\n-\
+    \ The Results section MUST report quantitative outcomes of the experiment.\n\n=== WHAT THIS PAPER\
+    \ MAY AND MAY NOT CLAIM (READ CAREFULLY) ===\n\nThe experiment in this paper evaluates ONE ensemble:\
+    \ AEMO's P5MIN forecast-vintage\nensemble for the Australian NEM. That ensemble's members are successive\
+    \ model vintages\nof the same forecasting system, not independent models and not debating agents.\n\
+    \n1. NEVER write that this work confirms, validates, or settles the hypothesis for\n   multi-agent\
+    \ or LLM-debate ensembles. It does not. It tests the statistical\n   mechanism on a model-vintage\
+    \ ensemble. Any sentence implying otherwise is a\n   factual error.\n\n2. COMPANION RE-ANALYSIS OF\
+    \ A SECOND ENSEMBLE — cite it, do NOT claim it as your\n   experiment. A frozen record of an LLM debate\
+    \ ensemble (20 episodes, 60 debate cells,\n   dated 2026-07-12) was re-analysed on the SAME base and\
+    \ the SAME definition of D as\n   this paper's experiment. Its validation is exact against the frozen\
+    \ record:\n   Vincentisation of the round-1 member quantile vectors reproduces the stored final\n\
+    \   quantile vectors on 60/60 cells, and recomputed CRPS matches the stored CRPS on\n   60/60 cells.\
+    \ Report it as a COMPANION RE-ANALYSIS OF PRIOR DATA with its date,\n   explicitly \"not re-run in\
+    \ this work\". Do NOT invent any numbers for it beyond those\n   given here.\n\n2b. ALPHA IS MEANINGLESS\
+    \ WITHOUT ITS BASE — state results as ELASTICITIES.\n   The widening exponent alpha depends entirely\
+    \ on what it multiplies, because some\n   bases already scale with the dispersion D and some do not.\
+    \ The parameterisation-free\n   quantity is the WIDTH ELASTICITY TO DIVERGENCE: the slope of log(interval\
+    \ width)\n   against log(D). Always report elasticities; whenever an alpha appears, name its base\n\
+    \   and state the constraint set it was optimised under.\n   This is not pedantry — it is a finding\
+    \ of this work. FOUR separate analyses of these\n   data reached different answers purely because\
+    \ of functional form: a clipped-linear\n   gamma that is identically zero below mean D and therefore\
+    \ saturates at any grid edge;\n   a floored form max(1, 1 + alpha*D) whose floor forbids shrinking;\
+    \ a monotone-\n   non-decreasing constraint that binds completely; and a free-scale power law. The\
+    \ form,\n   not the data, set the answer every time. Say so explicitly — it is a methodological\n\
+    \   contribution.\n\n3. THE ACTUAL CONTRIBUTION — build the paper on these, in this order:\n   (a)\
+    \ HEADLINE, and it is structural rather than estimated: the NATIVE width elasticity\n       to divergence\
+    \ differs sharply between the two ensembles — about +1.020 for the\n       AEMO point-member model-vintage\
+    \ ensemble (n = 84,610) versus about +0.240 for the\n       Vincentised LLM debate ensemble (n = 60\
+    \ cells, 20 episodes).\n   (b) THE MECHANISM behind (a), which is an exact algebraic result, not a\
+    \ statistical\n       one: interval width is a LINEAR functional of the quantile vector, and\n   \
+    \    Vincentisation averages quantiles level by level, so the width of a Vincentised\n       ensemble\
+    \ is IDENTICALLY the mean of its members' widths — verified to within\n       9.1e-13 across all 60\
+    \ cells. Cross-member dispersion therefore contributes\n       NOTHING to the aggregate width: Vincentisation\
+    \ destroys the divergence signal at\n       the aggregation step, and an explicit gamma(D) is the\
+    \ only way to reintroduce it.\n       The AEMO ensemble is the exact mirror image — its members are\
+    \ point forecasts with\n       zero within-member width, so its ensemble width IS its dispersion.\
+    \ State this as\n       the reason the two ensembles behave differently. Do NOT hand-wave it as \"\
+    LLM\n       ensembles are different\".\n   (c) The CRPS-optimal elasticity is SUBLINEAR on BOTH ensembles:\
+    \ about +0.770 on AEMO\n       and about +0.440 on the debate ensemble (95% CI +0.128 to +0.716).\
+    \ Because AEMO\n       starts ABOVE the optimum it requires SHRINKING (negative alpha, about -0.25),\n\
+    \       while the debate ensemble starts BELOW it and requires WIDENING (positive alpha,\n       about\
+    \ +0.20). Same sublinear target, opposite sides. This fully explains the\n       apparent alpha sign\
+    \ contradiction — say so; there was never a contradiction.\n   (d) CRITICAL HONESTY CONSTRAINT ON\
+    \ (c): AEMO's optimal elasticity 0.770 lies just\n       OUTSIDE the debate ensemble's CI upper bound\
+    \ of 0.716, so at n = 60 the two\n       OPTIMAL elasticities are NOT reliably distinguishable. Write\
+    \ \"both sublinear, in\n       the 0.4 to 0.8 range, difference unresolved at this sample size\".\
+    \ NEVER write\n       that the optimal elasticities differ. The well-powered claim is the NATIVE gap\
+    \ in\n       (a), which is structural.\n   (e) Under the specific parameterisation of an increasing\
+    \ gamma(D) applied to the\n       aggregated ensemble quantile function, the per-decile CRPS-optimal\
+    \ multiplier is\n       monotone DECREASING in D, so a gamma constrained non-decreasing cannot improve\
+    \ on\n       a constant and its maximum achievable gain is exactly zero. MECHANISM CONFIRMED,\n  \
+    \     PARAMETERISATION REFUTED — it needs re-basing, not deleting.\n   (f) D is not merely a volatility\
+    \ proxy: report the partial-correlation and control\n       comparisons against the realised-volatility\
+    \ feature. This is what kills the\n       heteroskedasticity confound.\n\n3b. THE TWO SIDES ARE NOT\
+    \ EQUALLY EVIDENCED — never present them as such. The AEMO side\n   is time-split, Diebold-Mariano\
+    \ tested and rolling-origin validated. The debate side is\n   IN-SAMPLE at n = 60 and cannot support\
+    \ a held-out fit. On the debate side the null is\n   rejected only marginally: Spearman +0.249 with\
+    \ a cluster-bootstrap 95% CI of +0.029 to\n   +0.434 over 20 episode clusters — it excludes zero,\
+    \ barely. That is NOT a\n   confirmation. Use RANK statistics only for the debate side; the Pearson\
+    \ correlation of\n   +0.917 on those pairs is a pure price-spike artefact and must not be quoted.\n\
+    \n3c. MANDATORY PROVENANCE DISCLOSURE — this sentence, or a faithful paraphrase of it,\n   MUST appear\
+    \ in the Methods section. The paper implicitly claims an autonomous\n   pipeline run; one undisclosed\
+    \ manual correction would make that claim false:\n     \"During the experiment-design stage the pipeline\
+    \ emitted a planning artefact that\n     named unrelated public benchmarks instead of the configured\
+    \ dataset, and that omitted\n     the comparator named in the configured research question. The dataset\
+    \ field was\n     manually corrected to name the configured dataset, and the comparator was restored\
+    \ by\n     name only, before code generation. No implementation, hyperparameter, result, metric,\n\
+    \     or analysis was supplied or altered by hand, and the original artefacts are retained.\"\n  \
+    \ Do NOT omit this because it is unflattering. Do NOT expand it into a discussion of\n   pipeline\
+    \ internals — one factual sentence in Methods.\n\n3d. DO NOT CITE UNVERIFIED PROVENANCE FIELDS. The\
+    \ pipeline's own planning artefacts\n   contain machine-generated fields that were never verified,\
+    \ and at least one is known\n   to be false: an invented \"NVIDIA RTX 6000 Ada\" hardware entry. The\
+    \ experiments in\n   this paper ran on Apple Silicon CPU with numpy/pandas/scikit-learn — no NVIDIA\
+    \ GPU\n   was involved and none may be named. More generally: do NOT state hardware, dataset\n   provenance,\
+    \ sample sizes, or dates in the paper unless they come from the actual\n   experiment outputs or from\
+    \ this constraint block. If a plan field asserts a fact you\n   cannot trace to a real artefact, omit\
+    \ it rather than repeat it.\n\n4. MANDATORY LIMITATIONS SECTION — all of the following must appear,\
+    \ in the paper's\n   own voice, not hedged away:\n   - Heteroskedasticity confound: volatile intervals\
+    \ inflate both the ensemble\n     dispersion D and the realised absolute error, so a raw correlation\
+    \ between them\n     overstates usable signal. This is why the paper's claims rest on CRPS and interval\n\
+    \     coverage under a time-ordered split, and on the comparison against the\n     volatility-conditioned\
+    \ control, rather than on correlation.\n   - The AEMO ensemble is a model-vintage ensemble; its members\
+    \ are not independent.\n   - The debate-side evidence is PRELIMINARY: n = 20 episodes, 2 regions,\
+    \ no classical\n     baselines, no validation-fitted hyperparameters, and in-sample only.\n   - Parse\
+    \ failures on the debate side: 32 of 60 cells had at least one round-1 agent\n     fail to parse.\
+    \ State the number as 32/60. IMPORTANT — do NOT write that a parse\n     failure substitutes a climatology\
+    \ forecast: falling back to climatology requires\n     ALL round-1 agents to fail, and no cell ever\
+    \ did (39 cells retained three members,\n     21 retained two). The correct characterisation is a\
+    \ REDUCED ensemble, not a\n     substituted forecast, and the result is stable when split by ensemble\
+    \ size\n     (three-member cells Spearman +0.290, elasticity +0.222; two-member cells +0.227\n   \
+    \  and +0.172 — same sign, same magnitude). So this confound does NOT drive the\n     result, and\
+    \ saying it does would be a factual error.\n   - Two months of data from a single market; results\
+    \ are not established out of sample\n     in time or across markets.\n=== END CONSTRAINT ===\n"
+sub_prompts:
+  iterative_improve:
+    system: You improve experiment projects and return valid executable Python code. Use ```filename:xxx.py
+      format for each file.
+    user: "Improve the experiment code based on prior run results.\nReturn the improved files using ```filename:xxx.py\
+      \ format for each file.\nPrimary metric key: {metric_key}\nMetric direction: {metric_direction}\n\
+      Do not use subprocess, os.system, eval, exec, or any network/shell calls.\nNUMPY 2.x: np.trapz→np.trapezoid,\
+      \ np.erfinv→scipy.special.erfinv, np.bool/int/float→Python builtins, np.math→math.\n\nEXPERIMENT\
+      \ PLAN ANCHOR (CRITICAL — read before making changes):\nThe research topic is: {topic}\n{exp_plan_anchor}RULES\
+      \ FOR REFINEMENT:\n- NEVER rename, remove, or replace existing condition names. The condition names\
+      \ in the code MUST match the experiment plan.\n- NEVER add new conditions that are not in the experiment\
+      \ plan.\n- ONLY improve the IMPLEMENTATION of existing conditions (fix bugs, tune hyperparameters,\
+      \ improve training loops).\n- If the code has fundamental issues (wrong algorithm, missing components),\
+      \ fix the implementation but keep the same condition names and class hierarchy.\n\n{condition_coverage_hint}SEED\
+      \ ENFORCEMENT (MANDATORY — BUG-183):\n- You MUST use exactly seeds = [0, 1, 2] (3 seeds minimum).\n\
+      - Each condition MUST loop over ALL seeds.\n- Print per-seed: condition=X seed=S {metric_key}: V\n\
+      - Print aggregated: condition=X {metric_key}_mean: M {metric_key}_std: S\n- If 3 seeds × all conditions\
+      \ exceeds the time budget, REDUCE training epochs or conditions — NEVER reduce seed count below\
+      \ 3.\n\nCONDITION COUNT LIMIT (HARD RULE):\n- MAXIMUM 8 total conditions (baselines + methods +\
+      \ ablations).\n- If the previous code had >8 conditions, consolidate ablations to 2-3 values.\n\n\
+      DOCKER MOUNT TOPOLOGY (for fixing PermissionError/path issues):\n- WRITABLE: the project directory\
+      \ and /tmp/\n- There is NO /opt/datasets on this machine and NO Docker image. Ignore any instruction\n\
+      \  mentioning /opt/datasets, CIFAR, MNIST or torchvision — torchvision is NOT installed.\n- THE\
+      \ ONLY DATASET is /Users/alexeynikitine/data/ws3_h2/ws3_h2_matched.csv, read with\n  pandas.read_csv\
+      \ and filtered to horizon_min == 5 and n_vintages >= 5. Never download anything.\n\n## MEASUREMENT\
+      \ CORRECTNESS — check these before anything else\nKnown defects to look for and FIX in the current\
+      \ code:\n1. CRPS MUST depend on the realised outcome y_true. An expression using only the predicted\n\
+      \   bounds, such as (upper - lower)/2, is an INTERVAL WIDTH, not a CRPS. Minimising it rewards\n\
+      \   the narrowest intervals regardless of whether they contain the outcome and inverts the study.\n\
+      \   Compute CRPS as 2 * mean over quantile levels tau of the pinball loss of (y_true, q_tau),\n\
+      \   over a grid of at least 19 levels from 0.05 to 0.95 — not the two interval endpoints.\n2. PINBALL\
+      \ LOSS needs BOTH branches at the correct level: tau*(y - q) when y >= q, and\n   (1 - tau)*(q -\
+      \ y) when y < q. A formula keeping one branch per bound, e.g.\n   max(0, y - lower)*0.1 + max(0,\
+      \ upper - y)*0.9, is minimised by collapsing the interval to a\n   point at the upper bound and\
+      \ under-penalises upper exceedance ninefold.\n3. EVERY reported metric must be a SINGLE FLOAT, never\
+      \ a numpy array. Aggregate per-row values\n   (mean, and separately median) before reporting.\n\
+      4. Do NOT report the same quantity twice under two names.\n\n## METRIC OUTPUT CONTRACT — stdout\
+      \ is parsed by a strict regex\nPrinting a dict, e.g. print(f\"condition={cond} seed={s} {metrics}\"\
+      ), emits {'CRPS': 12.3} and\nparses to NOTHING, leaving zero conditions and an unusable experiment.\
+      \ Print one metric per line:\n    condition=<ConditionName> seed=<k> <MetricName>: <float>\n   \
+      \ SUMMARY condition=<ConditionName> metric=<MetricName> mean=<float> std=<float>\nMetric names must\
+      \ be bare identifiers, no quotes, no braces. Also print a final\nprimary_metric: <float> line.\n\
+      \n## CONDITION SEMANTICS — a class that exists but computes nothing is NOT an implementation\nObserved\
+      \ in the current code: `NoWidening.predict` returns the raw feature matrix; the widener\nclasses\
+      \ multiply the FEATURE MATRIX by a scaling vector computed from the TRAIN rows, so no\npredictive\
+      \ interval is ever constructed and a train-length vector is applied to test rows.\nEvery condition\
+      \ MUST actually produce, for each test row, a pair (or grid) of predicted price\nquantiles in $/MWh\
+      \ derived from `ens_mean` plus a width, and must be scored against `rrp_actual`.\nThe definitions\
+      \ below are the ones this study is specified against — implement these, not stubs.\n### CONDITIONS\
+      \ YOU MUST IMPLEMENT (not optional, not \"if time permits\")\nEvery one of these MUST appear in\
+      \ the code and MUST print metrics. Omitting any one of\nthem invalidates the comparison, because\
+      \ each exists to kill a specific confound:\n1. `UnconditionalQuantileAggregation` — constant-width\
+      \ intervals from the TRAIN residual\n   quantiles of ens_mean. The baseline.\n2. `DivergenceConditionedWidening`\
+      \ — intervals scaled by a gamma(D) fitted on a held-out\n   slice of TRAIN, never on test. Report\
+      \ the base it multiplies.\n3. `VolatilityConditionedWidening` — identical mechanism conditioned\
+      \ on `vol_lag`\n   instead of `ens_sd`. WITHOUT THIS CONDITION THE PAPER CANNOT DISTINGUISH \"dispersion\n\
+      \   carries signal\" FROM \"any volatility proxy carries signal\", which is the single most\n  \
+      \ likely reviewer objection. It is mandatory.\n4. `NormalizedConformal` — location-scale / split-conformal,\
+      \ half-width proportional to\n   a train-fitted scale s(D). A DIFFERENT family from the multiplier;\
+      \ report both.\n5. Ablation `AlphaZero` / `NoWidening` — no widening at all. NOTE: this is the SAME\n\
+      \   ESTIMATOR as condition 1 (alpha=0 leaves the unconditional intervals unchanged).\n   Implement\
+      \ it once and report it as ONE row carrying both names, e.g.\n   \"UnconditionalQuantileAggregation\
+      \ (= NoWidening, alpha=0)\". Do NOT present them as\n   two independent conditions with two separate\
+      \ numbers — they are one comparator, and\n   reporting them twice would imply a comparison that\
+      \ does not exist.\n6. Ablation `ShuffledD` — D randomly permuted across rows, destroying the D-error\n\
+      \   association. If this does NOT degrade relative to condition 2, the apparent effect is\n   an\
+      \ artefact and you must say so.\nAdditionally: `alpha` must be SELECTED on a held-out slice of the\
+      \ TRAIN window (never a fixed\nconfig constant, never fitted on test), and any per-row scaling vector\
+      \ must be computed from the\nrows being predicted, not from the training rows.\n\n## DATA HANDLING\
+      \ FACTS FOR THIS DATASET — observed failures in the current code\n- DTYPE DISCIPLINE: `interval_datetime`\
+      \ is a DATETIME column. Never call `.values` on a frame\n  that still contains it and never feed\
+      \ it into arithmetic — the current code does\n  `val_df.drop(columns=['rrp_actual']).values` and\
+      \ dies with\n  `TypeError: unsupported operand type(s) for *: 'Timestamp' and 'float'`. Select the\
+      \ numeric\n  feature columns you need EXPLICITLY BY NAME (e.g. ens_mean, ens_sd, vol_lag, totaldemand,\n\
+      \  rrp_last_obs) and keep interval_datetime only for sorting and for the time-ordered split.\n-\
+      \ NEM PRICES GO NEGATIVE. This is a real and important market feature, not bad data: `rrp_actual`\n\
+      \  ranges from about -757 to +20,300 $/MWh. Do NOT apply log, log1p, sqrt or any transform with\
+      \ a\n  non-negative domain to a price or price-derived quantity. The current code raises\n  `RuntimeWarning:\
+      \ invalid value encountered in log1p`, which means it is silently producing NaNs\n  on exactly the\
+      \ negative-price intervals that matter most.\n\nCurrent project files:\n{files_context}\nRun summaries\
+      \ (JSON):\n{run_summaries}"
