@@ -157,3 +157,36 @@ researchclaw with --auto-approve, and get to stage-17 paper_draft.md.
 Do not use paid cloud LLM APIs. Read HANDOFF_LOCAL.md for full context
 on why the previous cloud 3B/simulated run never wrote a paper.
 ```
+
+
+---
+
+## Session result (2026-08-01, local fleet)
+
+**Host:** `macbook-pro` / `100.95.93.7` (real m5-prime-serve, M5 Max, 128 GB). Do **not** use Tailscale name `m5-prime-serve` (`100.77.102.76`).
+**Model:** `gpt-oss:120b` (~64.4 GB loaded, MXFP4).
+**Config:** `experiment.mode: sandbox`, `experiment.repair.enabled: false`, `--auto-approve`.
+**OP card:** #39 (In progress → close when founder accepts draft).
+
+### Artifacts
+
+| Item | Path |
+|------|------|
+| Run | `artifacts/rc-20260801-082705-3677fb/` |
+| **Paper draft (stage 17)** | `artifacts/rc-20260801-082705-3677fb/stage-17/paper_draft.md` |
+| Outline | `artifacts/rc-20260801-082705-3677fb/stage-16/outline.md` |
+| Refine metrics | `artifacts/rc-20260801-082705-3677fb/stage-13/refinement_log.json` (v2/v3) |
+| Plan (post-align) | `artifacts/rc-20260801-082705-3677fb/stage-09/exp_plan.yaml` |
+
+### What broke / what we fixed mid-run
+
+1. Stage-10 `main.py` had no `__main__` entrypoint → stage-12 exited in 0.2s with empty metrics. Stage-13 refine v2/v3 fixed this and produced real `primary_metric` for `dense` / `sparse_{10,25,50}`.
+2. FAB-2 hard-blocked PAPER_DRAFT: prose `proposed_methods` did not match scored prefixes, and with no `REGISTERED_CONDITIONS:` line the guard treated that as proven absence (`correspondence=ok`). Fixed in `researchclaw/pipeline/stage_impls/_execution.py` (scored-not-declared counts toward unresolved) + aligned `exp_plan.yaml` class_names to what actually ran. Regression: `tests/test_plan_condition_block.py::test_scored_without_registry_line_is_unresolved_not_proven_absence`.
+3. Re-ran `--from-stage PAPER_DRAFT` → non-empty draft (~5.4k words). Peer review / revision continued after.
+
+### Caveats for the draft
+
+- Toy byte-LM perplexity experiment: dense ~245 PPL beat sparse ~257 PPL. The draft still narrates a “SPAR / FLOP-reduction win” story — treat claims as LLM-written and verify against `stage-13/refinement_log.json` / `stage-14/experiment_summary.json` before any external use.
+- Figure Docker image `researchclaw/experiment:latest` missing; some charts came from local fallback on the second stage-14 pass.
+- Semantic Scholar 429s; Playwright chromium installed mid-run for future crawls.
+

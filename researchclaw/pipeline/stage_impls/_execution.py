@@ -305,14 +305,30 @@ def _plan_vs_scored(
         for c in coverage.get("registered", ()) or ()
         if _normalise_condition(c) not in matched_norm
     )
-    # Resolve the tentative verdicts: when EVERY registered condition mapped to
+    # Scored metric prefixes are an independent namespace from the optional
+    # REGISTERED_CONDITIONS line.  When experiments emit condition=/metric keys
+    # but never print the registry line, registered_not_declared stays empty
+    # even though the code clearly ran under names absent from the plan
+    # (e.g. dense/sparse_* vs prose proposed_methods).  Count those too, or
+    # FAB-2 mis-classifies the mismatch as proven absence (correspondence=ok)
+    # and hard-blocks a legitimate draft.
+    scored_not_declared = sorted(
+        c
+        for c in coverage.get("scored", ()) or ()
+        if _normalise_condition(c) not in matched_norm
+    )
+    code_not_declared_norm: dict[str, str] = {}
+    for c in registered_not_declared + scored_not_declared:
+        code_not_declared_norm.setdefault(_normalise_condition(c), c)
+    code_not_declared = sorted(code_not_declared_norm.values())
+    # Resolve the tentative verdicts: when EVERY code condition mapped to
     # a declared entry, there is no unaccounted code condition an unmatched
     # declaration could correspond to, so it genuinely was never registered.
     # Otherwise the namespaces do not line up and no absence claim is safe.
     for entry in entries:
         if entry["verdict"] == "unmatched":
             entry["verdict"] = (
-                "not_registered" if not registered_not_declared else "unresolved"
+                "not_registered" if not code_not_declared else "unresolved"
             )
 
     unmatched_declared = [
@@ -320,7 +336,7 @@ def _plan_vs_scored(
     ]
     if not declared:
         correspondence = "no_plan"
-    elif unmatched_declared and registered_not_declared:
+    elif unmatched_declared and code_not_declared:
         correspondence = "unresolved"
     else:
         correspondence = "ok"

@@ -230,3 +230,46 @@ def test_real_run_blocks_and_names_the_fabricated_baseline():
     # The paper's fabricated baseline row was a condition the plan declared and
     # the code never registered.
     assert "UnconditionalQuantileAggregation" in status["not_registered"]
+
+
+def test_scored_without_registry_line_is_unresolved_not_proven_absence():
+    """Metric-key prefixes alone must count as the code namespace.
+
+    When experiments print ``condition=dense/...`` metrics but never emit a
+    ``REGISTERED_CONDITIONS:`` line, ``registered`` is empty.  FAB-2 must then
+    treat prose plan names vs ``dense``/``sparse_*`` scored prefixes as a
+    naming mismatch (correspondence=unresolved), not as proven absence
+    (correspondence=ok + any_proposed_method_scored=False) which hard-blocks
+    PAPER_DRAFT — the failure mode of rc-20260801-082705-3677fb.
+    """
+    from researchclaw.pipeline.stage_impls._execution import (
+        _condition_coverage,
+        _declared_conditions,
+        _plan_vs_scored,
+    )
+
+    plan = """
+proposed_methods:
+  - Sparse-max attention via Gumbel-Softmax
+  - Dynamic blockwise routing
+baselines:
+  - Full Fine-Tuning
+"""
+    metrics = {
+        "dense/primary_metric": 245.0,
+        "sparse_10/primary_metric": 256.0,
+        "sparse_25/primary_metric": 256.0,
+    }
+    stdout = (
+        "condition=dense seed=0 primary_metric: 245.0\n"
+        "condition=sparse_10 seed=0 primary_metric: 256.0\n"
+    )
+    coverage = _condition_coverage(stdout, metrics)
+    assert coverage["scored"]  # prefixes present
+    assert coverage["registered"] == []  # no REGISTERED_CONDITIONS line
+    status = _plan_vs_scored(_declared_conditions(plan), coverage)
+    assert status["correspondence"] == "unresolved"
+    # Must NOT look like proven absence of the proposed method
+    assert not (
+        status["correspondence"] == "ok" and not status["any_proposed_method_scored"]
+    )
