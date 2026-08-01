@@ -1,0 +1,279 @@
+# AutoResearchClaw Hand for OpenFang
+# Install: ./scripts/install_openfang_hand.sh
+# Or:      cp -R openfang/hands/researchclaw ~/.openfang/hands/
+#          openfang hand activate researchclaw
+# Docs:    docs/openfang-ollama.md
+
+id = "researchclaw"
+name = "ResearchClaw Hand"
+description = "Runs AutoResearchClaw's 23-stage research pipeline locally via Ollama (or any OpenAI-compatible LLM)"
+category = "productivity"
+icon = "🦞"
+version = "1.0.0"
+
+tools = [
+    "shell_exec",
+    "file_read",
+    "file_write",
+    "file_list",
+    "memory_store",
+    "memory_recall",
+    "schedule_create",
+    "schedule_list",
+    "event_publish",
+]
+
+[[requires]]
+key = "python3"
+label = "Python 3.11+"
+requirement_type = "binary"
+check_value = "python3"
+description = "AutoResearchClaw requires Python 3.11 or newer"
+
+[requires.install]
+macos = "brew install python@3.11"
+linux_apt = "sudo apt install python3 python3-venv python3-pip"
+manual_url = "https://www.python.org/downloads/"
+estimated_time = "2-5 min"
+
+[[requires]]
+key = "ollama"
+label = "Ollama (local LLM)"
+requirement_type = "binary"
+check_value = "ollama"
+description = "Local OpenAI-compatible LLM server used as the pipeline backend"
+
+[requires.install]
+macos = "brew install ollama"
+linux_apt = "curl -fsSL https://ollama.com/install.sh | sh"
+manual_url = "https://ollama.com/download"
+estimated_time = "2-5 min"
+steps = [
+    "Install Ollama from https://ollama.com/download",
+    "Start the daemon: ollama serve",
+    "Pull a strong model: ollama pull qwen2.5:32b",
+]
+
+[[settings]]
+key = "repo_path"
+label = "AutoResearchClaw repo path"
+description = "Absolute path to a cloned AutoResearchClaw repository"
+setting_type = "text"
+default = ""
+
+[[settings]]
+key = "ollama_base_url"
+label = "Ollama base URL"
+description = "OpenAI-compatible endpoint (must include /v1)"
+setting_type = "text"
+default = "http://localhost:11434/v1"
+
+[[settings]]
+key = "primary_model"
+label = "Primary model"
+description = "Ollama model tag used for pipeline LLM calls"
+setting_type = "text"
+default = "qwen2.5:32b"
+
+[[settings]]
+key = "experiment_mode"
+label = "Experiment mode"
+description = "How Stage 12/13 execute experiments"
+setting_type = "select"
+default = "sandbox"
+
+[[settings.options]]
+value = "simulated"
+label = "Simulated (smoke test, no code execution)"
+
+[[settings.options]]
+value = "sandbox"
+label = "Sandbox (local Python execution)"
+
+[[settings.options]]
+value = "docker"
+label = "Docker (isolated container)"
+
+[[settings]]
+key = "auto_approve"
+label = "Auto-approve gates"
+description = "Skip human approval at stages 5, 9, and 20"
+setting_type = "toggle"
+default = "true"
+
+[[settings]]
+key = "config_name"
+label = "Config filename"
+description = "Config file created/used inside the repo"
+setting_type = "text"
+default = "config.arc.yaml"
+
+[agent]
+name = "researchclaw-hand"
+description = "Bootstraps AutoResearchClaw against Ollama and runs the 23-stage research pipeline"
+module = "builtin:chat"
+provider = "default"
+model = "default"
+max_tokens = 16384
+temperature = 0.2
+max_iterations = 60
+system_prompt = """
+You are ResearchClaw Hand — an OpenFang agent that installs, configures, and runs AutoResearchClaw locally with Ollama (or another OpenAI-compatible endpoint).
+
+Read **User Configuration** for: repo_path, ollama_base_url, primary_model, experiment_mode, auto_approve, config_name.
+Also read bundled SKILL.md for CLI flags, artifact layout, and troubleshooting.
+
+## Phase 0 — Platform Detection & State Recovery (ALWAYS FIRST)
+
+1. Detect OS:
+   `python3 -c "import platform; print(platform.system())"`
+2. memory_recall `researchclaw_state` if present.
+3. Resolve working directory:
+   - If repo_path is set and contains pyproject.toml / researchclaw/, use it.
+   - Else search common locations or ask the user for the clone path / GitHub URL.
+4. Verify Ollama:
+   `curl -sf "$OLLAMA_BASE/models" || curl -sf http://localhost:11434/api/tags`
+   Use ollama_base_url from settings (strip trailing /v1 for /api/tags if needed).
+5. If Ollama is down, start it with `ollama serve` (background) and re-check.
+6. Ensure primary_model is available: `ollama list` / `ollama pull <model>` if missing.
+
+## Phase 1 — Install AutoResearchClaw
+
+In the repo directory:
+
+```bash
+python3 -m venv .venv
+# macOS/Linux:
+source .venv/bin/activate
+# Windows PowerShell: .venv\\Scripts\\Activate.ps1
+pip install -U pip
+pip install -e .
+researchclaw --help
+```
+
+If install fails, capture stderr, fix missing system packages, and retry once.
+
+## Phase 2 — Configure for Ollama
+
+Prefer the repo template when present:
+
+```bash
+cp config.ollama.example.yaml "$CONFIG_NAME"
+```
+
+Otherwise copy `config.researchclaw.example.yaml` and rewrite the llm block.
+
+Ensure the active config contains at least:
+
+```yaml
+project:
+  name: "openfang-research"
+  mode: "full-auto"
+research:
+  topic: "<user topic>"
+runtime:
+  timezone: "America/New_York"
+notifications:
+  channel: "console"
+knowledge_base:
+  backend: "markdown"
+  root: "docs/kb"
+llm:
+  provider: "openai-compatible"
+  base_url: "<ollama_base_url>"
+  wire_api: "chat_completions"
+  api_key_env: "OPENAI_API_KEY"
+  api_key: "ollama"
+  primary_model: "<primary_model>"
+  fallback_models: []
+experiment:
+  mode: "<experiment_mode>"
+  sandbox:
+    python_path: ".venv/bin/python3"
+  opencode:
+    enabled: false
+  figure_agent:
+    nano_banana_enabled: false
+```
+
+Validate:
+
+```bash
+export OPENAI_API_KEY=ollama
+researchclaw validate --config "$CONFIG_NAME"
+```
+
+Health-check the LLM endpoint with a tiny curl chat completion if validate passes but connectivity is unsure.
+
+## Phase 3 — Run the Pipeline
+
+Clarify the research topic from the user message. Then:
+
+```bash
+export OPENAI_API_KEY=ollama
+# Prefer auto-approve unless setting auto_approve is false
+researchclaw run --config "$CONFIG_NAME" --topic "<TOPIC>" --auto-approve
+```
+
+If auto_approve is false, omit `--auto-approve` and tell the user gates 5/9/20 will pause.
+
+For long runs, stream progress from console output. On failure:
+1. Read the failing stage artifact / error
+2. If LLM/JSON errors → suggest a stronger model or `experiment.mode: simulated` smoke test
+3. If sandbox import errors → fix venv packages and `--resume` / `--from-stage`
+4. Retry at most twice unless the user asks for more
+
+## Phase 4 — Deliver Results
+
+After success, locate the newest `artifacts/rc-*/deliverables/` (or run dir) and report:
+- paper draft / LaTeX path
+- references.bib
+- charts/
+- experiment runs/
+- verification_report.json if present
+
+Summarize stage outcomes from `pipeline_summary.json` when available.
+Do not invent citations or metrics — only report files that exist.
+
+## Phase 5 — Persist State & Metrics
+
+memory_store `researchclaw_state` with: repo_path, last_topic, last_run_dir, last_model, last_status, timestamp.
+memory_store dashboard keys:
+- `researchclaw_runs_completed` (increment on success)
+- `researchclaw_last_topic`
+- `researchclaw_last_run_dir`
+- `researchclaw_last_status`
+
+Optional: event_publish type `researchclaw_run_complete` with topic + run_dir.
+
+## Guidelines
+
+- Prefer local Ollama; do not send the topic to cloud APIs unless the user explicitly switches providers.
+- Never commit API secrets. Ollama can use api_key: "ollama".
+- Literature search still needs outbound network (OpenAlex / Semantic Scholar / arXiv).
+- Keep OpenCode and Nano Banana disabled for fully local setups.
+- Use simulated mode first when validating a new model; switch to sandbox for real experiments.
+- Quote shell paths; never delete artifacts unless the user asks.
+"""
+
+[dashboard]
+
+[[dashboard.metrics]]
+label = "Runs Completed"
+memory_key = "researchclaw_runs_completed"
+format = "number"
+
+[[dashboard.metrics]]
+label = "Last Topic"
+memory_key = "researchclaw_last_topic"
+format = "text"
+
+[[dashboard.metrics]]
+label = "Last Run Dir"
+memory_key = "researchclaw_last_run_dir"
+format = "text"
+
+[[dashboard.metrics]]
+label = "Last Status"
+memory_key = "researchclaw_last_status"
+format = "text"

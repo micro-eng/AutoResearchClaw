@@ -1,0 +1,18 @@
+diff --git a/researchclaw/pipeline/stage_impls/_code_generation.py b/researchclaw/pipeline/stage_impls/_code_generation.py
+index e5f21dd..3af30be 100644
+--- a/researchclaw/pipeline/stage_impls/_code_generation.py
++++ b/researchclaw/pipeline/stage_impls/_code_generation.py
+@@ -103,7 +103,12 @@ def _execute_code_generation(
+         else:
+             pkg_prefix = "sandbox mode"
+             pkg_extras = ""
+-        if hw_profile and hw_profile.get("has_gpu"):
++        # WS3: a custom prompts file must be able to override the package hint.
++        # The GPU branches below build pkg_hint as a Python f-string, which no
++        # prompts YAML can reach; on Apple-silicon hosts that silently promises
++        # torch/MPS and steers statistical studies into training loops.
++        _custom_prompts = bool(getattr(config.prompts, "custom_file", ""))
++        if hw_profile and hw_profile.get("has_gpu") and not _custom_prompts:
+             gpu_type = hw_profile.get("gpu_type", "cuda")
+             gpu_name = hw_profile.get("gpu_name", "GPU")
+             tier = hw_profile.get("tier", "limited")

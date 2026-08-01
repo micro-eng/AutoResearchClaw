@@ -161,10 +161,20 @@ def _execute_result_analysis(
                     if _new_summary:
                         exp_data["metrics_summary"] = _new_summary
                         # Also update best_run with refinement data
+                        # FAB-1: report the refinement sandbox's ACTUAL terminal
+                        # outcome.  Hardcoding "completed" here stamped a clean
+                        # status onto a process that exited non-zero, which is
+                        # what let Stage 20 certify a crashed run as real data.
+                        _sbx_rc = _sbx.get("returncode")
                         exp_data["best_run"] = {
                             "run_id": "iterative-refine-best",
                             "task_id": "sandbox-main",
-                            "status": "completed",
+                            "status": (
+                                "completed" if _sbx_rc == 0
+                                else "partial" if _sbx.get("timed_out")
+                                else "failed"
+                            ),
+                            "returncode": _sbx_rc,
                             "metrics": {
                                 k: v for k, v in _refine_metrics.items()
                             },

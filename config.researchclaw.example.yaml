@@ -44,6 +44,14 @@ llm:
   fallback_models:
     - "gpt-4.1"
     - "gpt-4o-mini"
+  # --- Local Ollama (see config.ollama.example.yaml + docs/openfang-ollama.md) ---
+  # provider: "openai-compatible"
+  # base_url: "http://localhost:11434/v1"
+  # wire_api: "chat_completions"
+  # api_key_env: "OPENAI_API_KEY"
+  # api_key: "ollama"
+  # primary_model: "qwen2.5:32b"
+  # fallback_models: []
   # --- MiniMax provider example ---
   # provider: "minimax"
   # api_key_env: "MINIMAX_API_KEY"

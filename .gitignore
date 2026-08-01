@@ -81,8 +81,7 @@ cli_pause
 
 config_*.yaml
 
-# Frontend (local dev only)
-frontend/
+# Frontend is shipped (researchclaw serve mounts ./frontend)
 
 # Test outputs and run logs (local only)
 test_outputs*/

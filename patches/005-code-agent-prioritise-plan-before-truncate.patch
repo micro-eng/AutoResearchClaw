@@ -1,0 +1,71 @@
+diff --git a/researchclaw/pipeline/code_agent.py b/researchclaw/pipeline/code_agent.py
+index e19ae6b..6959690 100644
+--- a/researchclaw/pipeline/code_agent.py
++++ b/researchclaw/pipeline/code_agent.py
+@@ -33,6 +33,57 @@ from typing import Any, Protocol
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Plan sections the code generator must never lose to truncation, most important
++# first. exp_plan is emitted as alphabetically-sorted YAML, so "ablations" sorts
++# first and "proposed_methods" second-to-last: a plain [:N] cut systematically
++# keeps the ablations and drops the method they ablate, yielding an experiment
++# that runs clean but cannot test its own hypothesis.
++_PLAN_PRIORITY_SECTIONS = (
++    "proposed_methods",
++    "implementation_specifications",
++    "baselines",
++    "ablations",
++    "datasets",
++    "metrics",
++)
++
++
++def _prioritise_plan(exp_plan: str, limit: int) -> str:
++    """Reorder top-level YAML sections of *exp_plan* before truncating to *limit*.
++
++    Keeps the method-defining sections at the front so that any content lost to
++    the character budget is low-priority tail content rather than the proposed
++    method itself. Falls back to a plain truncation if the plan cannot be split.
++    """
++    if len(exp_plan) <= limit:
++        return exp_plan
++
++    matches = list(re.finditer(r"^([a-z_]+):", exp_plan, re.MULTILINE))
++    if not matches:
++        return exp_plan[:limit]
++
++    sections: dict[str, str] = {}
++    order: list[str] = []
++    for idx, m in enumerate(matches):
++        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(exp_plan)
++        name = m.group(1)
++        sections[name] = exp_plan[m.start():end]
++        order.append(name)
++
++    ranked = [s for s in _PLAN_PRIORITY_SECTIONS if s in sections]
++    ranked += [s for s in order if s not in ranked]
++
++    out: list[str] = []
++    used = 0
++    for name in ranked:
++        chunk = sections[name]
++        if used + len(chunk) > limit:
++            continue
++        out.append(chunk)
++        used += len(chunk)
++    return "".join(out) if out else exp_plan[:limit]
++
++
+ # ---------------------------------------------------------------------------
+ # Configuration
+ # ---------------------------------------------------------------------------
+@@ -540,7 +591,7 @@ class CodeAgent:
+                 dependency_summaries=dep_summaries,
+                 dependency_code=dep_code,
+                 topic=topic,
+-                exp_plan=exp_plan[:4000],  # Truncate to avoid token overflow
++                exp_plan=_prioritise_plan(exp_plan, 4000),  # Truncate, method sections first
+                 pkg_hint=pkg_hint,
+             )
+             resp = self._chat(sp.system, sp.user, max_tokens=8192)

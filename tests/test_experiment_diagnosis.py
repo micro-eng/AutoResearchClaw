@@ -271,7 +271,11 @@ class TestDatasetNotFoundError:
         crashes = [d for d in diag.deficiencies if d.type == DeficiencyType.CODE_CRASH]
         assert not any("DatasetNotFoundError" in c.description for c in crashes)
 
-    def test_suggested_fix_mentions_precached(self):
+    def test_suggested_fix_is_domain_neutral(self):
+        # 2026-07-31: the fix advice used to hardcode "/opt/datasets" (CIFAR/MNIST),
+        # which steered repair cycles for non-vision experiments into torchvision
+        # imports against a path that does not exist. The advice is now domain-neutral:
+        # it must name the plan's dataset and must NOT mention the removed poison paths.
         stderr = (
             "DatasetNotFoundError: Dataset 'imagenet_v2' "
             "doesn't exist on the Hub or cannot be accessed.\n"
@@ -281,7 +285,9 @@ class TestDatasetNotFoundError:
             stderr=stderr,
         )
         ds_issues = [d for d in diag.deficiencies if d.type == DeficiencyType.DATASET_UNAVAILABLE]
-        assert any("/opt/datasets" in d.suggested_fix for d in ds_issues)
+        assert ds_issues, "DATASET_UNAVAILABLE deficiency should still be raised"
+        assert all("/opt/datasets" not in d.suggested_fix for d in ds_issues)
+        assert any("exact dataset" in d.suggested_fix.lower() for d in ds_issues)
 
 
 class TestNearRandomAccuracy:

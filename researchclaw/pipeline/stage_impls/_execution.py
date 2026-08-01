@@ -40,6 +40,527 @@ from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
 
+def _summarise_run_outcomes(runs_dir: Path) -> dict[str, Any]:
+    """BUG-RUN-01: derive the honest stage-12 outcome from its own run payloads.
+
+    Stage 12 used to return DONE/proceed unconditionally, so a ``run-1.json``
+    carrying ``status: failed, metrics: {}`` was wrapped in a ``decision.json``
+    saying ``status: done, decision: proceed, error: null``. The wrapper must
+    reflect what it wraps.
+
+    Only ``run-*.json`` files are inspected — ``results.json`` and the
+    ``sandbox/`` working directory in the same folder are not run payloads.
+    """
+    summary: dict[str, Any] = {
+        "runs": 0,
+        "completed": 0,
+        "partial": 0,
+        "failed": 0,
+        "simulated": 0,
+        "other": 0,
+        "with_metrics": 0,
+        "degraded": False,
+        "reason": None,
+    }
+    for run_file in sorted(runs_dir.glob("run-*.json")):
+        payload = _safe_json_loads(run_file.read_text(encoding="utf-8"), {})
+        if not isinstance(payload, dict):
+            continue
+        summary["runs"] += 1
+        status = str(payload.get("status") or "other")
+        if status in ("completed", "partial", "failed", "simulated"):
+            summary[status] += 1
+        else:
+            summary["other"] += 1
+        metrics = payload.get("metrics")
+        if not isinstance(metrics, dict) or not metrics:
+            metrics = payload.get("key_metrics")
+        if isinstance(metrics, dict) and metrics:
+            summary["with_metrics"] += 1
+
+    if summary["runs"] == 0:
+        summary["degraded"] = True
+        summary["reason"] = "Stage 12 produced no run artifacts."
+        return summary
+
+    bad = summary["failed"] + summary["partial"]
+    if bad:
+        summary["degraded"] = True
+        summary["reason"] = (
+            f"{bad}/{summary['runs']} experiment run(s) did not complete "
+            f"(failed={summary['failed']}, partial={summary['partial']}); "
+            f"{summary['with_metrics']}/{summary['runs']} emitted metrics."
+        )
+    return summary
+
+
+_REGISTERED_CONDITIONS_RE = re.compile(
+    r"^REGISTERED_CONDITIONS:\s*(?P<names>.+)$", re.MULTILINE
+)
+_CONDITION_LABEL_RE = re.compile(r"\bcondition=(?P<name>[^\s,;]+)")
+
+
+def _normalise_condition(name: str) -> str:
+    """Canonical form for comparing condition names across artefacts."""
+    return str(name).strip().strip("'\"").casefold()
+
+
+def _condition_coverage(stdout: str, metrics: dict[str, Any]) -> dict[str, Any]:
+    """BUG-COND-01: which registered conditions actually produced metrics.
+
+    Stage 13's R7-3 hint asked only whether *any* ``condition=`` label appeared
+    in stdout, so one surviving condition out of five read as full coverage.
+    In ``rc-ws3-h2-real4-20260731`` five conditions were registered and only
+    ``NoWidening`` — the no-widening **control** — ever scored; the paper then
+    reported the control's number under the proposed method's name.
+
+    ``registered`` comes from the ``REGISTERED_CONDITIONS:`` line the generated
+    code already prints. ``scored`` comes from condition-prefixed metric keys
+    (``NoWidening/CRPS``), i.e. conditions that produced a number, which is a
+    stricter and more useful signal than ``ran`` (a ``condition=`` label, which
+    a condition prints before it crashes).
+
+    Reporting only — it never selects, filters or judges a condition. Callers
+    ask membership via :func:`_condition_scored`, so "was the *proposed method*
+    among the scored?" is answerable, not just "how many scored?".
+
+    ``complete`` is ``None`` when no registry line was found: unknown coverage
+    must not be reported as full coverage.
+
+    **Scope limit — the CODE's registry, not the PLAN's.** ``registered`` is
+    read from stdout, so it can only contain conditions the generated code got
+    as far as registering. A condition the experiment *plan* declares and the
+    code never mentions is invisible here, and ``complete: True`` therefore
+    means "every condition the code registered scored" — never "the planned
+    experiment ran". Comparing against ``exp_plan.yaml``'s declared set is a
+    separate check that must not be inferred from this one. This is a
+    refinement-loop diagnostic reporting what a run did; an integrity guard
+    deciding whether a paper may be written should key on the plan, not on a
+    stdout string.
+    """
+    registered: list[str] = []
+    match = _REGISTERED_CONDITIONS_RE.search(stdout or "")
+    if match:
+        seen: set[str] = set()
+        for raw in match.group("names").split(","):
+            name = raw.strip().strip("'\"")
+            if name and _normalise_condition(name) not in seen:
+                seen.add(_normalise_condition(name))
+                registered.append(name)
+
+    scored: set[str] = set()
+    for key in (metrics or {}):
+        text = str(key)
+        if "/" in text:
+            scored.add(text.split("/", 1)[0])
+
+    ran: set[str] = {
+        m.group("name") for m in _CONDITION_LABEL_RE.finditer(stdout or "")
+    }
+
+    scored_norm = {_normalise_condition(c) for c in scored}
+    unscored = [c for c in registered if _normalise_condition(c) not in scored_norm]
+    return {
+        "registered": registered,
+        "scored": sorted(scored),
+        "ran": sorted(ran),
+        "unscored": unscored,
+        "registered_count": len(registered),
+        "scored_count": len(scored),
+        "complete": (not unscored) if registered else None,
+    }
+
+
+def _condition_scored(coverage: dict[str, Any], name: str) -> bool:
+    """Did *name* produce a metric? Exact name match, never a substring.
+
+    ``"NoWidening"`` must not satisfy a query for ``"NoWideningPlus"``, and a
+    proposed method must never be reported as scored because an ablation of it
+    shares a prefix.
+    """
+    target = _normalise_condition(name)
+    return any(
+        _normalise_condition(c) == target for c in coverage.get("scored", ())
+    )
+
+
+_PLAN_CONDITION_SECTIONS = ("proposed_methods", "ablations", "baselines")
+
+
+def _declared_conditions(exp_plan_text: str) -> list[dict[str, Any]]:
+    """Conditions the experiment PLAN declares, with their code identifiers.
+
+    Each entry carries the plan's prose ``name`` and its
+    ``implementation_spec.class_name`` — **the class name is what the generated
+    code registers, and the only field safe to match on.** The two differ
+    routinely and non-systematically: run 4's plan pairs
+    ``name: DivergenceConditionedWidening`` with
+    ``class_name: DivergenceConditionedWidener``, and run 1's pairs
+    ``name: NoWidening`` with ``class_name: FixedIntervalWidener``. Comparing
+    prose names to the registry scores 0/8 on run 1 and would report every
+    condition missing on a run where five were registered.
+    """
+    try:
+        import yaml as _yaml
+    except ImportError:  # pragma: no cover - pyyaml is a hard dependency
+        return []
+    try:
+        plan = _yaml.safe_load(exp_plan_text or "") or {}
+    except Exception:  # noqa: BLE001 - a malformed plan is not fatal here
+        return []
+    if not isinstance(plan, dict):
+        return []
+
+    declared: list[dict[str, Any]] = []
+    for section in _PLAN_CONDITION_SECTIONS:
+        entries = plan.get(section)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            # `baselines:` is routinely a list of BARE STRINGS
+            # (`- UnconditionalQuantileAggregation`) while methods and
+            # ablations are mappings. Skipping non-dicts drops exactly the
+            # entries most at risk: run 4 declared three string baselines,
+            # none were ever registered, and one of them is the fabricated
+            # row in the paper.
+            if isinstance(entry, str):
+                declared.append(
+                    {"section": section, "name": entry, "class_name": None}
+                )
+                continue
+            if not isinstance(entry, dict):
+                continue
+            class_name = entry.get("class_name")
+            if not isinstance(class_name, str):
+                for sub in ("implementation_spec", "implementation", "spec"):
+                    nested = entry.get(sub)
+                    if isinstance(nested, dict) and isinstance(
+                        nested.get("class_name"), str
+                    ):
+                        class_name = nested["class_name"]
+                        break
+            name = entry.get("name")
+            declared.append(
+                {
+                    "section": section,
+                    "name": name if isinstance(name, str) else None,
+                    "class_name": class_name if isinstance(class_name, str) else None,
+                }
+            )
+    return declared
+
+
+def _plan_vs_scored(
+    declared: list[dict[str, Any]], coverage: dict[str, Any]
+) -> dict[str, Any]:
+    """BUG-COND-02: did the conditions the PLAN declares actually score?
+
+    Registered-vs-scored cannot catch a condition the code never registered at
+    all. In ``rc-ws3-h2-real-20260731`` the code never defined the proposed
+    method across three attempts: five conditions registered, none of them the
+    paper's subject. Registered-vs-scored reports "complete" there; only a
+    plan-side comparison sees it.
+
+    Matching is exact-normalised on ``class_name``. Two fail-closed rules keep
+    a naming problem from being reported as a scientific one:
+
+    * a declared entry with **no** ``class_name`` is ``unresolved``, never
+      ``missing`` — it could not be matched, which is not evidence of absence;
+    * if names are unmatched on **both** sides, ``correspondence`` is
+      ``"unresolved"`` and the per-entry verdicts must not be read as
+      missing-ness — the two namespaces simply do not line up.
+    """
+    scored_norm = {
+        _normalise_condition(c) for c in coverage.get("scored", ()) or ()
+    }
+    registered_norm = {
+        _normalise_condition(c) for c in coverage.get("registered", ()) or ()
+    }
+
+    entries: list[dict[str, Any]] = []
+    matched_norm: set[str] = set()
+    for item in declared:
+        # A bare-string entry gives only a prose name; fall back to it so the
+        # entry is classified at all, but remember that the match was weaker.
+        identifier = item.get("class_name") or item.get("name")
+        key = _normalise_condition(identifier) if identifier else ""
+        if not key:
+            verdict = "unresolved"
+        elif key in scored_norm:
+            verdict = "scored"
+            matched_norm.add(key)
+        elif key in registered_norm:
+            verdict = "registered_not_scored"
+            matched_norm.add(key)
+        elif item.get("class_name"):
+            verdict = "not_registered"
+        else:
+            # No declared class name and no name match: cannot yet distinguish
+            # "absent" from "registered under a name we can't map".
+            verdict = "unmatched"
+        entries.append({**item, "verdict": verdict})
+
+    registered_not_declared = sorted(
+        c
+        for c in coverage.get("registered", ()) or ()
+        if _normalise_condition(c) not in matched_norm
+    )
+    # Scored metric prefixes are an independent namespace from the optional
+    # REGISTERED_CONDITIONS line.  When experiments emit condition=/metric keys
+    # but never print the registry line, registered_not_declared stays empty
+    # even though the code clearly ran under names absent from the plan
+    # (e.g. dense/sparse_* vs prose proposed_methods).  Count those too, or
+    # FAB-2 mis-classifies the mismatch as proven absence (correspondence=ok)
+    # and hard-blocks a legitimate draft.
+    scored_not_declared = sorted(
+        c
+        for c in coverage.get("scored", ()) or ()
+        if _normalise_condition(c) not in matched_norm
+    )
+    code_not_declared_norm: dict[str, str] = {}
+    for c in registered_not_declared + scored_not_declared:
+        code_not_declared_norm.setdefault(_normalise_condition(c), c)
+    code_not_declared = sorted(code_not_declared_norm.values())
+    # Resolve the tentative verdicts: when EVERY code condition mapped to
+    # a declared entry, there is no unaccounted code condition an unmatched
+    # declaration could correspond to, so it genuinely was never registered.
+    # Otherwise the namespaces do not line up and no absence claim is safe.
+    for entry in entries:
+        if entry["verdict"] == "unmatched":
+            entry["verdict"] = (
+                "not_registered" if not code_not_declared else "unresolved"
+            )
+
+    unmatched_declared = [
+        e for e in entries if e["verdict"] in ("not_registered", "unresolved")
+    ]
+    if not declared:
+        correspondence = "no_plan"
+    elif unmatched_declared and code_not_declared:
+        correspondence = "unresolved"
+    else:
+        correspondence = "ok"
+
+    proposed = [e for e in entries if e["section"] == "proposed_methods"]
+    return {
+        "declared_count": len(entries),
+        "entries": entries,
+        "correspondence": correspondence,
+        "registered_not_declared": registered_not_declared,
+        "scored": [e["class_name"] or e["name"] for e in entries if e["verdict"] == "scored"],
+        "not_registered": [
+            e["class_name"] or e["name"] for e in entries if e["verdict"] == "not_registered"
+        ],
+        "unresolved": [e["name"] for e in entries if e["verdict"] == "unresolved"],
+        "proposed_methods": [e["class_name"] or e["name"] for e in proposed],
+        "proposed_methods_scored": [
+            e["class_name"] or e["name"] for e in proposed if e["verdict"] == "scored"
+        ],
+        "any_proposed_method_scored": any(e["verdict"] == "scored" for e in proposed),
+    }
+
+
+def _describe_plan_gap(plan_status: dict[str, Any]) -> str | None:
+    """Human-readable plan-vs-scored finding, or ``None`` when there is none."""
+    if plan_status.get("correspondence") == "no_plan":
+        return None
+    if plan_status.get("correspondence") == "unresolved":
+        return (
+            "Plan/code condition names do not correspond: the plan declares "
+            f"{len(plan_status['not_registered']) + len(plan_status['unresolved'])} "
+            "name(s) with no match in the code, and the code registered "
+            f"{len(plan_status['registered_not_declared'])} name(s) absent from "
+            "the plan. NO conclusion about missing conditions can be drawn — "
+            "this is a naming-correspondence failure, not evidence that a "
+            "condition was skipped."
+        )
+    if not plan_status.get("any_proposed_method_scored") and plan_status.get(
+        "proposed_methods"
+    ):
+        return (
+            "NO declared proposed method produced metrics "
+            f"({', '.join(plan_status['proposed_methods'])}). Scored: "
+            f"{', '.join(plan_status['scored']) or '(none)'}. A paper comparing "
+            "the proposed method against a baseline cannot be supported."
+        )
+    if plan_status.get("not_registered"):
+        return (
+            "Declared but never registered by the code: "
+            f"{', '.join(plan_status['not_registered'])}."
+        )
+    return None
+
+
+def _describe_condition_gap(coverage: dict[str, Any]) -> str | None:
+    """Human-readable gap line, or ``None`` when coverage is complete/unknown."""
+    if not coverage.get("unscored"):
+        return None
+    return (
+        f"{coverage['scored_count']}/{coverage['registered_count']} registered "
+        f"condition(s) produced metrics. Scored: "
+        f"{', '.join(coverage['scored']) or '(none)'}. "
+        f"NO metrics from: {', '.join(coverage['unscored'])}. "
+        f"A comparison across conditions cannot be supported by this run."
+    )
+
+
+def _last_sandbox_record(iter_record: dict[str, Any]) -> dict[str, Any]:
+    """The sandbox run whose METRICS describe the files in the version dir.
+
+    ``sandbox_after_fix`` when a runtime repair rewrote and re-ran the code,
+    otherwise the first ``sandbox`` run.
+
+    **Metrics only — do NOT read stdout from this.** ``sandbox_after_fix`` is
+    written without a ``stdout`` key (see the re-run block in
+    ``_execute_iterative_refine``), so on a repaired iteration it carries the
+    metrics with a zero-length stdout. Anything parsing stdout must use
+    :func:`_registry_stdout`, which prefers the surface that actually has it.
+    Following this function's convention for stdout would silently read ""
+    on exactly the repaired iterations that matter.
+    """
+    sandbox = iter_record.get("sandbox_after_fix")
+    if not isinstance(sandbox, dict):
+        sandbox = iter_record.get("sandbox")
+    return sandbox if isinstance(sandbox, dict) else {}
+
+
+def _registry_stdout(iter_record: dict[str, Any]) -> str:
+    """Stdout for condition parsing — the surface that actually carries it.
+
+    Prefers whichever run's stdout contains a ``REGISTERED_CONDITIONS:`` line,
+    then any non-empty stdout, rather than assuming a fixed run. The metrics
+    and the stdout of one iteration live on **different** records when a
+    runtime repair fired.
+    """
+    candidates = [
+        iter_record.get("sandbox"),
+        iter_record.get("sandbox_after_fix"),
+    ]
+    texts = [
+        c.get("stdout") or "" for c in candidates if isinstance(c, dict)
+    ]
+    for text in texts:
+        if _REGISTERED_CONDITIONS_RE.search(text):
+            return text
+    return next((t for t in texts if t), "")
+
+
+def _describe_metric_key_miss(
+    metric_key: str, metrics: dict[str, Any]
+) -> str | None:
+    """BUG-METRIC-01: distinguish "emitted nothing" from "emitted, none matched".
+
+    ``_find_metric`` returning ``None`` was indistinguishable from an experiment
+    that produced no output at all, and the pipeline reported the second. In
+    ``rc-ws3-h2-real4-20260731`` the configured ``metric_key`` was
+    ``primary_metric`` while the code emitted ``CRPS``, ``Coverage90``,
+    ``Width90``, ``PinballLoss``, ``success_rate`` and ``MedianCRPS`` — all five
+    matching branches of ``_find_metric`` miss, so **no run of that experiment
+    could ever have scored**, clean or crashed.
+
+    Returns a diagnosis when *metrics* is non-empty, else ``None``.
+
+    **Precondition: call only where ``_find_metric`` has already returned
+    ``None``.** This does not re-run the matching logic — duplicating those five
+    branches would let the diagnosis drift from the decision it explains — so
+    called without that precondition it will describe a miss that did not occur.
+
+    Deliberately does NOT pick a substitute metric: choosing between ``CRPS``
+    and ``Coverage90`` (opposite directions) would be authoring the experiment,
+    and a wrong choice silently optimises refinement against the wrong
+    objective. Naming the metric is the run config's job.
+    """
+    if not metrics:
+        return None
+    names = sorted({str(k).rsplit("/", 1)[-1] for k in metrics})
+    return (
+        f"Experiment emitted {len(metrics)} metric key(s) but none yielded a "
+        f"finite value for the configured metric_key {metric_key!r}. "
+        f"Emitted names: {', '.join(names[:12])}"
+        f"{' ...' if len(names) > 12 else ''}. "
+        f"Refinement cannot score this experiment until metric_key names one of "
+        f"them (or the code emits {metric_key!r})."
+    )
+
+
+def _refinement_progress_key(
+    iteration: int, iter_record: dict[str, Any]
+) -> tuple[int, int, int, int, int]:
+    """Rank a stage-13 refinement version by how far it actually got.
+
+    Used only when NO version produces the primary metric, so ``_is_better``
+    has nothing to compare. Ordered tuple, higher is better:
+
+    ``(exited_cleanly, n_conditions_scored, n_metric_keys_emitted,
+    did_not_time_out, iteration)``
+
+    ``n_conditions_scored`` outranks ``n_metric_keys_emitted`` deliberately:
+    key count is a proxy that a 1-of-5-condition run can win on volume alone
+    (34 keys from one condition beat 30 keys from five), which would rank a
+    fragment of an experiment above a complete one. Conditions are the unit the
+    experiment is actually made of.
+
+    ``iteration`` breaks ties so the latest validation-passing version wins in
+    modes that never run a sandbox (where the first three terms are constant).
+    The measurement is taken from the *last* sandbox run of the iteration —
+    ``sandbox_after_fix`` when a runtime repair re-ran the code, because those
+    are the files actually written to the version directory.
+
+    **Scope boundary — progress, NOT quality.** This ranks how far a version got
+    before stopping. It is not a claim that the adopted version is scientifically
+    better, and ``adoption_reason: progress_fallback_no_metric_anywhere`` must
+    never be read as one: it says only *no version produced the configured
+    metric, and this one ran furthest*. Judging which version is actually better
+    requires an objective, which is the run config's and the experiment plan's
+    job — see ``_describe_metric_key_miss`` for why this module declines to pick
+    one. A version that runs further while optimising a degenerate objective
+    still ranks highest here, correctly: the alternative is discarding every
+    refinement whenever the objective is unusable.
+    """
+    sandbox = _last_sandbox_record(iter_record)
+    metrics = sandbox.get("metrics")
+    n_metrics = len(metrics) if isinstance(metrics, dict) else 0
+    coverage = iter_record.get("condition_coverage")
+    n_conditions = (
+        int(coverage.get("scored_count") or 0)
+        if isinstance(coverage, dict)
+        else 0
+    )
+    exited_cleanly = 1 if sandbox.get("returncode") == 0 else 0
+    not_timed_out = 0 if sandbox.get("timed_out") else 1
+    return (exited_cleanly, n_conditions, n_metrics, not_timed_out, iteration)
+
+
+def _decide_refinement_adoption(
+    *,
+    best_version: str,
+    best_metric: float | None,
+    progress_version: str | None,
+    progress_key: tuple[int, ...] | None,
+) -> tuple[str, str]:
+    """BUG-ADOPT-01: decide which stage-13 version becomes ``experiment_final``.
+
+    Adoption used to be reachable only through an improving metric: the
+    ``elif validation.ok and best_version == "experiment/"`` fallback sat in
+    the ``orelse`` of ``if validation.ok and mode in ("sandbox", "docker")``
+    while itself requiring ``validation.ok``, making it unreachable in exactly
+    the modes that run code (AST-verified). One unrelated crash therefore
+    zeroed the metric for every version and silently reverted ``experiment_final``
+    to the original stage-10 code.
+
+    Returns ``(adopted_version, reason)``. The caller logs the reason either
+    way, so "the original was kept" is now a recorded decision, not silence.
+    """
+    if best_version != "experiment/":
+        return best_version, "metric_improvement"
+    if best_metric is not None:
+        # A real metric exists and no refinement beat it — keeping the
+        # original is a genuine comparison, not a discarded improvement.
+        return best_version, "original_retained_no_metric_improvement"
+    if progress_version is not None and progress_key is not None:
+        return progress_version, "progress_fallback_no_metric_anywhere"
+    return best_version, "original_retained_no_valid_candidate"
+
 
 def _execute_resource_planning(
     stage_dir: Path,
@@ -325,11 +846,57 @@ def _execute_experiment_run(
             (runs_dir / f"{_safe_filename(run_id)}.json").write_text(
                 json.dumps(payload, indent=2), encoding="utf-8"
             )
+    # FAB-1: Do not report `status: done, error: null` over runs that recorded
+    # `failed` with empty metrics.  The stage still returns DONE so the Stage 13
+    # refinement / repair loop can attempt a fix, but decision.json must carry
+    # the truth — a downstream reader (human or stage) that sees error=null
+    # reasonably concludes the experiment produced results.
+    from researchclaw.pipeline.results_evidence import (
+        collect_results_evidence as _collect_results_evidence,
+    )
+    _s12_evidence = _collect_results_evidence(run_dir)
+    _s12_error: str | None = None
+    _s12_decision = "proceed"
+    if _s12_evidence.is_authoritative and not _s12_evidence.has_real_metrics:
+        _s12_decision = "no_results"
+        _s12_error = (
+            "No run produced a finite metric: "
+            + "; ".join(
+                f"{e.source} {e.outcome} ({e.detail})"
+                for e in _s12_evidence.executions
+            )
+        )
+        logger.warning("Stage 12: %s", _s12_error)
+        (stage_dir / "results_evidence.json").write_text(
+            json.dumps(_s12_evidence.to_dict(), indent=2), encoding="utf-8"
+        )
+
+    # BUG-RUN-01: the metric-evidence check above stays silent when a run
+    # crashes *after* emitting numbers — `status: failed` with a non-empty
+    # `metrics` dict still reported `decision: proceed, error: null`. The
+    # terminal status of each run payload is its own signal and must surface
+    # too. Deliberately still StageStatus.DONE: Stage 12 is not in
+    # NONCRITICAL_STAGES, so a FAILED result makes runner.py break out of the
+    # pipeline and destroys the repair path (stage 13 refinement, then stage 14
+    # diagnosis + repair) that can still recover a crashed run.
+    _s12_outcome = _summarise_run_outcomes(runs_dir)
+    (stage_dir / "run_outcome.json").write_text(
+        json.dumps(_s12_outcome, indent=2), encoding="utf-8"
+    )
+    if _s12_outcome["degraded"]:
+        logger.warning("Stage 12: %s", _s12_outcome["reason"])
+        if _s12_decision == "proceed":
+            _s12_decision = "degraded"
+        _s12_error = "; ".join(
+            part for part in (_s12_error, _s12_outcome["reason"]) if part
+        )
     return StageResult(
         stage=Stage.EXPERIMENT_RUN,
         status=StageStatus.DONE,
-        artifacts=("runs/",),
-        evidence_refs=("stage-12/runs/",),
+        artifacts=("runs/", "run_outcome.json"),
+        evidence_refs=("stage-12/runs/", "stage-12/run_outcome.json"),
+        decision=_s12_decision,
+        error=_s12_error,
     )
 
 
@@ -625,6 +1192,13 @@ def _execute_iterative_refine(
     no_improve_streak = 0
     consecutive_no_metrics = 0
 
+    # BUG-ADOPT-01: best validation-passing version by raw progress, tracked
+    # independently of the metric so a crash that zeroes the metric for every
+    # version cannot silently revert experiment_final to the original code.
+    progress_files: dict[str, str] | None = None
+    progress_version: str | None = None
+    progress_key: tuple[int, int, int, int] | None = None
+
     log: dict[str, Any] = {
         "generated": _utcnow_iso(),
         "mode": config.experiment.mode,
@@ -730,8 +1304,34 @@ def _execute_iterative_refine(
     if _exp_plan_text and run_summaries:
         # Check if stdout contains condition labels
         _all_stdout = " ".join(run_summaries)
-        _has_condition_labels = "condition=" in _all_stdout
-        if not _has_condition_labels and _exp_plan_text.strip():
+        _has_condition_labels = bool(_CONDITION_LABEL_RE.search(_all_stdout))
+        # BUG-COND-01: the original test was `"condition=" in _all_stdout`, so a
+        # SINGLE surviving condition out of five read as full coverage and the
+        # hint fell silent on exactly the runs that most need it. Reuse the
+        # prior-run metrics to ask which registered conditions actually scored.
+        _prior_metrics: dict[str, Any] = {}
+        if runs_dir_path is not None:
+            for _rf in sorted(runs_dir_path.glob("run-*.json")):
+                _rp = _safe_json_loads(_rf.read_text(encoding="utf-8"), {})
+                if isinstance(_rp, dict) and isinstance(_rp.get("metrics"), dict):
+                    _prior_metrics.update(_rp["metrics"])
+        _prior_coverage = _condition_coverage(_all_stdout, _prior_metrics)
+        _prior_gap = _describe_condition_gap(_prior_coverage)
+        if _prior_gap and _exp_plan_text.strip():
+            _condition_coverage_hint = (
+                "\nCONDITION COVERAGE GAP DETECTED:\n"
+                f"{_prior_gap}\n"
+                "You MUST:\n"
+                "1. Run ALL conditions/treatments from the experiment plan independently\n"
+                "2. Label each metric output: `condition=<name> {metric_key}: <value>`\n"
+                "3. Print a SUMMARY line comparing all conditions after completion\n"
+                "4. Ensure a condition that fails does not silently skip the rest — "
+                "report it and continue to the remaining conditions\n"
+                "This is the MOST IMPORTANT improvement — metrics from a subset of "
+                "conditions cannot support any comparative conclusions.\n\n"
+            )
+            logger.warning("Stage 13: %s", _prior_gap)
+        elif not _has_condition_labels and _exp_plan_text.strip():
             _condition_coverage_hint = (
                 "\nCONDITION COVERAGE GAP DETECTED:\n"
                 "The experiment plan specifies multiple conditions/treatments, "
@@ -796,7 +1396,20 @@ def _execute_iterative_refine(
                 )
                 logger.warning("Stage 13: metric saturation detected, injecting difficulty upgrade hint")
 
-        files_context = _files_to_context(best_files)
+        # BUG-ADOPT-01: while no version has produced a metric, `best_files` is
+        # pinned to the original code, so every iteration re-refines the
+        # original and improvements never compound (this is why successive
+        # codegen attempts look byte-identical). Refine from the best progress
+        # candidate instead; the ranking is monotone, so a regressing iteration
+        # is not fed forward. Once a metric exists, `best_files` governs again
+        # and behaviour is unchanged.
+        refine_source_files = best_files
+        refine_source_version = best_version
+        if best_metric is None and progress_files is not None:
+            refine_source_files = progress_files
+            refine_source_version = progress_version or best_version
+
+        files_context = _files_to_context(refine_source_files)
         # BUG-10 fix: anchor refinement to original experiment plan
         _exp_plan_anchor = ""
         if _exp_plan_text.strip():
@@ -861,18 +1474,18 @@ def _execute_iterative_refine(
             single_code = _extract_code_block(response.content)
             if single_code.strip():
                 extracted_files = {"main.py": single_code}
-        # R8-2: Merge with best_files to preserve supporting modules
+        # R8-2: Merge with the refinement source to preserve supporting modules
         # (e.g., graphs.py, game.py) that the LLM didn't rewrite
-        candidate_files = dict(best_files)
+        candidate_files = dict(refine_source_files)
         if extracted_files:
             candidate_files.update(extracted_files)
-        # If LLM returned nothing at all, candidate_files == best_files (unchanged)
+        # If LLM returned nothing at all, candidate_files == refine_source_files
 
         # BUG-R6-02: Preserve entry point when LLM strips main() function.
         # The LLM often returns only class/function improvements without the
         # main() entry point, causing the script to exit with no output.
         _new_main = candidate_files.get("main.py", "")
-        _old_main = best_files.get("main.py", "")
+        _old_main = refine_source_files.get("main.py", "")
         if (
             _new_main
             and _old_main
@@ -942,6 +1555,7 @@ def _execute_iterative_refine(
             "repaired": repaired,
             "metric": None,
             "improved": False,
+            "refined_from": refine_source_version,
         }
         if issue_text:
             iter_record["validation_issues"] = issue_text
@@ -1095,9 +1709,46 @@ def _execute_iterative_refine(
                     no_improve_streak += 1
             else:
                 consecutive_no_metrics += 1
-        elif validation.ok and best_version == "experiment/":
-            best_files = dict(candidate_files)
-            best_version = f"experiment_v{iteration}/"
+                # BUG-METRIC-01: "no metric" and "no results" are different
+                # failures and used to be reported identically.
+                _miss = _describe_metric_key_miss(
+                    metric_key, _last_sandbox_record(iter_record).get("metrics") or {}
+                )
+                if _miss:
+                    iter_record["metric_key_mismatch"] = _miss
+                    logger.warning("Stage 13 iteration %d: %s", iteration, _miss)
+
+        # BUG-COND-01: record which registered conditions actually scored,
+        # before the progress ranking reads it. Computed even when a metric
+        # exists — a run that scores on one of five conditions is exactly the
+        # shape that produced a fabricated comparison in run 4.
+        # NB: stdout and metrics come from DIFFERENT records on a repaired
+        # iteration — `sandbox_after_fix` carries the metrics with no stdout.
+        _coverage = _condition_coverage(
+            _registry_stdout(iter_record),
+            _last_sandbox_record(iter_record).get("metrics") or {},
+        )
+        if _coverage["registered_count"] or _coverage["scored_count"]:
+            iter_record["condition_coverage"] = _coverage
+            _gap = _describe_condition_gap(_coverage)
+            if _gap:
+                logger.warning("Stage 13 iteration %d: %s", iteration, _gap)
+
+        # BUG-ADOPT-01: rank this version by raw progress, whether or not it
+        # produced the primary metric. This replaces the
+        # `elif validation.ok and best_version == "experiment/"` fallback that
+        # used to sit here: it was the orelse of
+        # `if validation.ok and mode in ("sandbox", "docker")` while itself
+        # requiring validation.ok, so in the modes that actually run code it
+        # was unreachable (AST-verified). The adoption decision now happens
+        # after the loop, in _decide_refinement_adoption, and is logged.
+        if validation.ok:
+            _iter_progress = _refinement_progress_key(iteration, iter_record)
+            iter_record["progress_key"] = list(_iter_progress)
+            if progress_key is None or _iter_progress > progress_key:
+                progress_key = _iter_progress
+                progress_files = dict(candidate_files)
+                progress_version = f"experiment_v{iteration}/"
 
         # P1: Track metric for saturation detection
         _metrics_history.append(metric_val)
@@ -1118,6 +1769,102 @@ def _execute_iterative_refine(
                 no_improve_streak,
             )
             break
+
+    # BUG-ADOPT-01: decide — and RECORD — which version becomes the final one.
+    # Previously this was implicit: whatever `best_files` happened to hold,
+    # with no log line when that was the unmodified original.
+    _adopted_version, _adoption_reason = _decide_refinement_adoption(
+        best_version=best_version,
+        best_metric=best_metric,
+        progress_version=progress_version,
+        progress_key=progress_key,
+    )
+    if _adopted_version != best_version and progress_files is not None:
+        best_files = dict(progress_files)
+        best_version = _adopted_version
+        logger.warning(
+            "Stage 13: no version produced metric '%s'; adopting %s on progress "
+            "(exited_cleanly=%d, conditions_scored=%d, metric_keys=%d, "
+            "not_timed_out=%d, iteration=%d) "
+            "rather than reverting experiment_final to the original code.",
+            metric_key,
+            best_version,
+            *(progress_key or (0, 0, 0, 0, 0)),
+        )
+    elif _adoption_reason == "original_retained_no_valid_candidate":
+        logger.warning(
+            "Stage 13: no refinement candidate passed validation — "
+            "experiment_final is the ORIGINAL experiment code."
+        )
+    logger.info(
+        "Stage 13 adoption: version=%s reason=%s best_metric=%s",
+        best_version,
+        _adoption_reason,
+        best_metric,
+    )
+    log["adoption_reason"] = _adoption_reason
+    log["adoption_progress_key"] = list(progress_key) if progress_key else None
+    log["progress_version"] = progress_version
+    # BUG-METRIC-01: surface the mismatch at the top of the log, not only
+    # buried per-iteration — a `best_metric: null` with metrics on disk means
+    # "unscorable config", not "the experiment produced nothing".
+    _mismatches = [
+        entry["metric_key_mismatch"]
+        for entry in log["iterations"]
+        if isinstance(entry, dict) and entry.get("metric_key_mismatch")
+    ]
+    # BUG-COND-01: hoist the coverage of the ADOPTED version, so a consumer can
+    # ask "was the proposed method among the scored?" without walking
+    # iterations. Stage 17's anti-fabrication guard is the intended reader: it
+    # currently fires only on ZERO metrics, so one surviving ablation disarms
+    # it and the writing stage is free to report a control's number under the
+    # proposed method's name. This is the fact that guard needs.
+    _adopted_entry = next(
+        (
+            entry
+            for entry in reversed(log["iterations"])
+            if isinstance(entry, dict)
+            and entry.get("version_dir") == best_version
+        ),
+        None,
+    )
+    _adopted_coverage = (
+        _adopted_entry.get("condition_coverage")
+        if isinstance(_adopted_entry, dict)
+        else None
+    )
+    if isinstance(_adopted_coverage, dict):
+        log["condition_coverage"] = _adopted_coverage
+        _gap = _describe_condition_gap(_adopted_coverage)
+        if _gap:
+            log["condition_coverage_gap"] = _gap
+            logger.warning("Stage 13: adopted version %s — %s", best_version, _gap)
+
+        # BUG-COND-02: registered-vs-scored cannot see a condition the code
+        # never registered. In run 1 the proposed method was never defined at
+        # all; in run 4 all three declared BASELINES went unregistered — and
+        # the fabricated baseline row in the paper is one of them. The gap
+        # between what the plan promises and what the code registers is where
+        # fabrication has a declared hook, so it needs its own field.
+        _plan_status = _plan_vs_scored(
+            _declared_conditions(_exp_plan_text), _adopted_coverage
+        )
+        if _plan_status["declared_count"]:
+            log["plan_condition_status"] = _plan_status
+            _plan_gap = _describe_plan_gap(_plan_status)
+            if _plan_gap:
+                log["plan_condition_gap"] = _plan_gap
+                logger.warning("Stage 13: %s", _plan_gap)
+
+    if _mismatches:
+        log["metric_key_mismatch"] = _mismatches[-1]
+        logger.warning(
+            "Stage 13: metric_key %r matched nothing in %d/%d iteration(s) — "
+            "the adoption score was unavailable by configuration, not by failure.",
+            metric_key,
+            len(_mismatches),
+            len(log["iterations"]),
+        )
 
     # Write final experiment directory
     final_dir = stage_dir / "experiment_final"
