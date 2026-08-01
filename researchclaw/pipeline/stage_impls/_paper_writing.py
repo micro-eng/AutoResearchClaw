@@ -142,6 +142,111 @@ def _execute_paper_outline(
     )
 
 
+def _collect_plan_condition_status(run_dir: Path) -> dict[str, Any] | None:
+    """FAB-2: reconcile the PLAN's declared conditions against what scored.
+
+    Returns ``None`` when there is no plan to reconcile against — absence of a
+    plan is never evidence that a condition was skipped.
+
+    Two deliberate choices:
+
+    * **The scored set comes from the AUTHORITATIVE refinement log only, via
+      ``_read_prior_artifact``.** A run can carry three logs (``stage-13/``,
+      ``stage-13_v1/``, ``stage-13_v2/``), all reporting
+      ``best_version: "experiment/"``, and they disagree: on run 4 the registries
+      are 5, 5 and **6** conditions and ``NoWidening`` scores in a different
+      iteration of each. On rollback the *completed* cycle is archived to
+      ``stage-13_vN`` and the new cycle takes the bare name, so ``stage-13`` is
+      the newest — which ``_read_prior_artifact``'s existing sort key already
+      resolves to. Note ``sorted(glob("stage-13*"))[-1]`` picks ``stage-13_v2``:
+      lexicographically last, chronologically *middle*.
+
+      A union across all cycles was the first design here and is **wrong**: if an
+      archived cycle scored the proposed method and the current one did not, the
+      paper is still written from the current cycle and its numbers still have no
+      source. Union would fail open in exactly the direction that matters.
+    * **The matching logic is imported, not re-implemented.** ``_plan_vs_scored``
+      and ``_declared_conditions`` live in ``_execution.py``; a second copy would
+      drift from the field it explains.
+    """
+    plan_path = run_dir / "stage-09" / "exp_plan.yaml"
+    if not plan_path.is_file():
+        return None
+    try:
+        plan_text = plan_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    # FAB-2: deliberately NOT wrapped in try/except ImportError.
+    #
+    # The first version of this caught ImportError, logged a warning and
+    # returned None — the same value that means "no plan, nothing to check".
+    # On a tree carrying patch 006 without 007 that made the anti-fabrication
+    # guard **silently disable itself**: no exception, no halted stage, FAB-2
+    # simply never fires and the paper is drafted, with one WARNING line as the
+    # only trace.  That is fail-OPEN in a guard's own error handling — the exact
+    # property rejected in the union design three commits earlier.
+    #
+    # A missing dependency is a deployment error, not a runtime condition. Let
+    # it propagate: the runner marks PAPER_DRAFT failed with an actionable
+    # message, which fails SAFE. Note an import-level smoke test will not catch
+    # a partially-applied tree, because this import is function-local by design
+    # (it breaks a module-level cycle) — apply 006 and 007 together or neither.
+    from researchclaw.pipeline.stage_impls._execution import (
+        _condition_coverage,
+        _declared_conditions,
+        _describe_plan_gap,
+        _plan_vs_scored,
+    )
+
+    declared = _declared_conditions(plan_text)
+    if not declared:
+        return None
+
+    stdout_parts: list[str] = []
+    merged_metrics: dict[str, Any] = {}
+    log_text = _read_prior_artifact(run_dir, "refinement_log.json")
+    if log_text:
+        log_data = _safe_json_loads(log_text, {})
+        if isinstance(log_data, dict):
+            for iteration in log_data.get("iterations", []) or []:
+                if not isinstance(iteration, dict):
+                    continue
+                for key in ("sandbox", "sandbox_after_fix"):
+                    entry = iteration.get(key)
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("stdout"):
+                        stdout_parts.append(str(entry["stdout"]))
+                    if isinstance(entry.get("metrics"), dict):
+                        merged_metrics.update(entry["metrics"])
+
+    runs_dir_str = _read_prior_artifact(run_dir, "runs/")
+    if runs_dir_str:
+        for run_file in sorted(Path(runs_dir_str).glob("*.json")):
+            if run_file.name == "results.json":
+                continue
+            try:
+                payload = json.loads(run_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("status") == "simulated":
+                continue
+            if payload.get("stdout"):
+                stdout_parts.append(str(payload["stdout"]))
+            if isinstance(payload.get("metrics"), dict):
+                merged_metrics.update(payload["metrics"])
+
+    coverage = _condition_coverage("\n".join(stdout_parts), merged_metrics)
+    status = _plan_vs_scored(declared, coverage)
+    status["gap_description"] = _describe_plan_gap(status)
+    status["scored_source"] = (
+        "authoritative refinement_log.json + runs/ (via _read_prior_artifact)"
+    )
+    return status
+
+
 def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
     """Collect raw experiment metric lines from stdout for paper writing.
 
@@ -1285,6 +1390,15 @@ def _execute_paper_draft(
             exp_summary_text = _read_prior_artifact(run_dir, "experiment_summary.json")
     exp_metrics_instruction = ""
     has_real_metrics = False
+    # FAB-1: Reconcile against execution artefacts (runs/*.json, refinement
+    # sandbox returncodes) BEFORE anything derived from them is consulted.
+    # experiment_summary.json is a derived artefact and can carry metrics that
+    # a crashed process emitted; only this tells us whether a process actually
+    # terminated with results.
+    from researchclaw.pipeline.results_evidence import (
+        collect_results_evidence as _collect_results_evidence,
+    )
+    _results_evidence = _collect_results_evidence(run_dir)
     _verified_registry = None  # Phase 1: anti-fabrication verified data registry
     # BUG-108: Load refinement_log so VerifiedRegistry has per-iteration metrics
     _refinement_log_for_vr: dict | None = None
@@ -1327,15 +1441,34 @@ def _execute_paper_draft(
     # Collect raw experiment stdout metrics as hard constraint for the paper
     raw_metrics_block, _has_parsed_metrics = _collect_raw_experiment_metrics(run_dir)
     if raw_metrics_block:
-        # BUG-23: Raw stdout alone is not sufficient — require either
-        # metrics_summary data, parsed metrics from run JSONs,
-        # OR at least 3 condition= patterns in raw block
-        _has_condition_pattern = len(re.findall(
-            r"condition[=:]", raw_metrics_block, re.IGNORECASE
-        )) >= 3
-        if has_real_metrics or _has_parsed_metrics or _has_condition_pattern:
-            has_real_metrics = True
+        # FAB-1: Raw stdout is NEVER evidence.  The previous rule here accepted
+        # >= 3 matches of ``condition[=:]`` in raw stdout as proof of real
+        # metrics — but a crashed run prints "Running condition: <name>" before
+        # dying, so the pipeline's own progress messages satisfied its own
+        # anti-fabrication guard.  A guard must key on the artefact it protects,
+        # not on a proxy that the failure path itself produces.
         exp_metrics_instruction += raw_metrics_block
+
+    # FAB-1: The execution artefacts are authoritative in BOTH directions.
+    # ``has_real_metrics`` may only be True when some execution terminated
+    # cleanly (or timed out) AND emitted at least one finite result value.
+    if _results_evidence.is_authoritative:
+        if has_real_metrics and not _results_evidence.has_real_metrics:
+            logger.error(
+                "FAB-1: experiment_summary reports metrics but NO execution "
+                "produced them. Overriding has_real_metrics to False.\n%s",
+                "\n".join(_results_evidence.blocking_reasons()),
+            )
+        has_real_metrics = _results_evidence.has_real_metrics
+    elif has_real_metrics or _has_parsed_metrics:
+        # No execution artefacts at all (e.g. externally supplied results).
+        # Fall back to the derived-artefact signal, but say so.
+        logger.warning(
+            "FAB-1: no execution artefacts found under %s — falling back to "
+            "derived experiment_summary/run metrics for has_real_metrics",
+            run_dir,
+        )
+        has_real_metrics = True
 
     # R18-1 + R19-6: Inject paired statistical comparisons AND condition summaries
     if exp_summary_text:
@@ -1617,30 +1750,105 @@ def _execute_paper_draft(
         config.research.topic, config.research.domains
     )
     _empirical_domains = {"ml", "engineering", "biology", "chemistry"}
+    # FAB-1: Always persist the reconciliation so the block (or the pass) is
+    # auditable from the run directory alone.
+    (stage_dir / "results_evidence.json").write_text(
+        json.dumps(_results_evidence.to_dict(), indent=2), encoding="utf-8"
+    )
     if not has_real_metrics and not _is_lit_first:
         if _domain_id in _empirical_domains:
+            _block_reasons = _results_evidence.blocking_reasons()
             logger.error(
-                "BLOCKED: Cannot write paper — experiment produced NO metrics. "
-                "The pipeline will not fabricate results."
+                "BLOCKED: Cannot write paper — no execution produced a finite "
+                "metric. The pipeline will not fabricate results.\n%s",
+                "\n".join(_block_reasons),
             )
             (stage_dir / "paper_draft.md").write_text(
                 "# Paper Draft Blocked\n\n"
-                "**Reason**: Experiment stage produced no metrics (status: failed/timeout). "
+                "**Reason**: No experiment execution terminated with results. "
                 "Cannot write a paper without real experimental data.\n\n"
-                "**Action Required**: Fix experiment execution or increase time_budget_sec.",
+                + (
+                    "**Evidence (`results_evidence.json`)**:\n\n```\n"
+                    + "\n".join(_block_reasons)
+                    + "\n```\n\n"
+                    if _block_reasons
+                    else ""
+                )
+                + "**Action Required**: Fix experiment execution or increase time_budget_sec.",
                 encoding="utf-8",
             )
             return StageResult(
                 stage=Stage.PAPER_DRAFT,
                 status=StageStatus.FAILED,
-                artifacts=("paper_draft.md",),
-                evidence_refs=(),
+                artifacts=("paper_draft.md", "results_evidence.json"),
+                evidence_refs=("stage-17/results_evidence.json",),
+                error=(
+                    "No execution produced a finite metric — refusing to draft a "
+                    "paper (see stage-17/results_evidence.json)"
+                ),
             )
         else:
             logger.warning(
                 "No experiment metrics found, but domain '%s' may be non-empirical "
                 "(theoretical/mathematical). Proceeding with paper draft.",
                 _domain_name,
+            )
+
+    # FAB-2: HARD BLOCK — the paper's SUBJECT never ran.
+    #
+    # FAB-1 asks "did ANY process emit a number".  That trigger is too narrow:
+    # a run where 1 of N conditions scored passes it, and the paper may then
+    # tabulate all N.  That is the 2026-07-31 incident's own shape — 8 declared,
+    # 5 registered, 1 scored, 5+ tabulated, with the fabricated baseline row
+    # (UnconditionalQuantileAggregation) being a condition the plan declared and
+    # the code never registered.
+    #
+    # Softer treatments are known to fail: run 4 already recorded
+    # `final_mode: "preliminary_study"` and the writing stage fabricated a
+    # 4.51-point win with t-tests anyway.  The flag was set and ignored.
+    # If the paper's subject never ran, there is no paper.
+    #
+    # FAIL CLOSED: block only on PROVEN absence.  `correspondence == "ok"` means
+    # the plan and code namespaces reconciled; on "unresolved" an unscored
+    # proposed method is a NAMING finding, and blocking there would halt every
+    # run with a name mismatch.  "no_plan" never blocks.
+    _plan_status: dict[str, Any] | None = None
+    if not _is_lit_first and _domain_id in _empirical_domains:
+        _plan_status = _collect_plan_condition_status(run_dir)
+    if _plan_status is not None:
+        (stage_dir / "plan_condition_status.json").write_text(
+            json.dumps(_plan_status, indent=2, default=str), encoding="utf-8"
+        )
+        if (
+            _plan_status.get("correspondence") == "ok"
+            and _plan_status.get("proposed_methods")
+            and not _plan_status.get("any_proposed_method_scored")
+        ):
+            _gap = _plan_status.get("gap_description") or (
+                "No declared proposed method produced metrics."
+            )
+            logger.error("BLOCKED (FAB-2): %s", _gap)
+            (stage_dir / "paper_draft.md").write_text(
+                "# Paper Draft Blocked\n\n"
+                "**Reason**: the paper's subject never ran. No proposed method "
+                "declared in the experiment plan produced any metric.\n\n"
+                f"**Finding**: {_gap}\n\n"
+                "**Evidence**: `plan_condition_status.json` "
+                "(declared set from `stage-09/exp_plan.yaml`, scored set from "
+                "the execution artefacts).\n\n"
+                "**Action Required**: make the proposed method run and score, "
+                "or change the plan to declare what is actually being tested.",
+                encoding="utf-8",
+            )
+            return StageResult(
+                stage=Stage.PAPER_DRAFT,
+                status=StageStatus.FAILED,
+                artifacts=("paper_draft.md", "plan_condition_status.json"),
+                evidence_refs=("stage-17/plan_condition_status.json",),
+                error=(
+                    "No declared proposed method produced a metric — refusing to "
+                    "draft a paper (see stage-17/plan_condition_status.json)"
+                ),
             )
 
     # R11-5: Experiment quality minimum threshold before paper writing

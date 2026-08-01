@@ -71,7 +71,15 @@ experiment:
   mode: "sandbox"
   time_budget_sec: 900
   max_iterations: 6
-  metric_key: "primary_metric"
+  # HAZARD (h2-pipeline 2026-07-31): minimising a metric NAMED CRPS is safe ONLY while that metric
+  # is a PROPER scoring rule. The stage-10 baseline has repeatedly emitted
+  #   crps = (y_pred[:,1] - y_pred[:,0]) / 2      <- an interval HALF-WIDTH
+  # whose argmin is lower==upper: zero-width intervals, coverage 0. With adoption working
+  # (patch 007), the gate would faithfully drive interval collapse and score it as improvement.
+  # Mitigation is in prompts.h2-real.yaml: proper-CRPS requirement + a DEGENERACY_CHECK line.
+  # A coverage-CONSTRAINED objective is the alternative; that is a founder-grade research
+  # decision and is deliberately NOT encoded here, nor in _is_better.
+  metric_key: "CRPS"  # 2026-07-31: was "primary_metric", which no emitted key can ever match (_find_metric: key in mk) — even a clean run scored metric_val=None
   metric_direction: "minimize"
   sandbox:
     python_path: ".venv/bin/python3"

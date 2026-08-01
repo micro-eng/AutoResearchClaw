@@ -76,45 +76,55 @@ blocks:
     `max(0, y - lower)*0.1 + max(0, upper - y)*0.9`) is NOT a pinball loss: it is minimised by\ndriving\
     \ the interval toward a single point at the upper bound and it under-penalises\nexceedance of the\
     \ upper bound by a factor of nine relative to the lower. Implement both\nbranches for every quantile\
-    \ level on the grid.\n\n### CRPS DEFINITION — a width is NOT a CRPS\nCRPS MUST be a function of the\
-    \ realised outcome y_true. An expression that uses only the\npredicted bounds, such as `(upper - lower)/2`,\
-    \ is an INTERVAL WIDTH, not a CRPS: minimising it\nrewards the narrowest possible intervals regardless\
-    \ of whether they contain the outcome, which\nsilently inverts the entire study. Compute CRPS over\
-    \ a quantile grid as\n`2 * mean over quantile levels tau of the pinball loss of (y_true, q_tau)`,\
-    \ where the pinball\nloss is `max(tau*(y_true - q_tau), (tau-1)*(y_true - q_tau))`. Use a grid of\
-    \ at least 19 levels\n(0.05 to 0.95), not just the two interval endpoints. If you instead report a\
-    \ mean pinball loss,\nlabel it \"mean pinball loss\" and never \"CRPS\". Print which convention you\
-    \ used.\n\n### CRPS DEFINITION\nCRPS equals TWICE the integral of the pinball loss over the quantile\
-    \ levels. If you\ncompute a mean pinball loss, either multiply by 2 or label the number \"mean pinball\n\
-    loss\" — never print a mean pinball loss under the name \"CRPS\". Print which convention\nyou used.\n\
-    \n### REPORT THE WIDTH EXPONENT, NOT JUST ALPHA (hard requirement)\nAn alpha value is meaningless\
-    \ unless the base it multiplies is stated, because the base\nmay already scale with D. The parameterisation-free\
-    \ quantity is the implied TOTAL\ninterval width exponent on D: the slope of log(interval width) against\
-    \ log(D). For every\ncondition that conditions on D, print that exponent, and print which base the\
-    \ alpha\nrefers to. Prefer the exponent over alpha when stating any result.\n\nAlso print, per D-decile,\
-    \ the multiplier that would have been CRPS-optimal for that\ndecile, and the Spearman correlation\
-    \ of those optimal multipliers against decile index.\nA negative correlation combined with a gamma(D)\
-    \ constrained non-decreasing in D means\nthe constraint binds and the best achievable gamma under\
-    \ that form is a constant. That\nis a real finding about the parameterisation and must be printed,\
-    \ not hidden.\n\n### THE DIRECTION OF THE RESULT IS NOT KNOWN\nDo not write code that assumes divergence-conditioned\
-    \ widening helps. A null or negative\nresult is a perfectly good outcome and must be reported as-is.\
-    \ The selected alpha may\nlegitimately come out as zero. Never tune on the test window to rescue a\
-    \ direction.\n\n### AVAILABLE PACKAGES (host Python, verified)\nnumpy 2.4, pandas 3.0, scipy 1.17,\
-    \ scikit-learn 1.9, matplotlib 3.11, pyarrow, torch 2.13\n(CPU/MPS), tqdm, plus the Python standard\
-    \ library.\nNOT AVAILABLE — importing any of these is an instant failure: torchvision, seaborn,\n\
-    statsmodels, duckdb, datasets, transformers, tensorflow, jax, lightgbm, catboost.\nNOTE: `xgboost`\
-    \ 3.2.0 IS now installed and MAY be used (`from xgboost import XGBRegressor`).\nFor a random-forest\
-    \ baseline use `sklearn.ensemble.RandomForestRegressor`. Use the\nREGRESSOR variants, never the Classifier\
-    \ variants — the target `rrp_actual` is a\ncontinuous price in $/MWh, not a class label. Better still:\
-    \ remember that this is an\nINTERVAL-CALIBRATION study, not a point-forecast-accuracy study — the\
-    \ point forecast\n`ens_mean` is GIVEN in the data and does not need to be re-learned. Do not spend\
-    \ the\ntime budget training regressors when the question is how wide the intervals should be.\n\n\
-    ### FORBIDDEN\n- Do NOT invent, guess, or construct any other dataset path. There is one path, above.\n\
-    - Do NOT generate synthetic or random predictors. The whole point of this study is that\n  the ensemble\
-    \ is real. `np.random.normal` as a data source is an instant failure.\n- Do NOT substitute an image/vision\
-    \ dataset. Do NOT import torchvision.\n- Do NOT write setup.py or requirements.txt. There is no network\
-    \ and no pip.\n- If the file cannot be read, PRINT THE ERROR AND EXIT NON-ZERO. Never fall back to\n\
-    \  synthetic data — a silent synthetic fallback is worse than a crash.\n"
+    \ level on the grid.\n\n### THE OBJECTIVE MUST NOT HAVE A DEGENERATE OPTIMUM (read before choosing\
+    \ any metric)\nThe refinement gate MINIMISES the metric named `CRPS`. That metric MUST therefore be\
+    \ a PROPER\nscoring rule — one whose optimum is the true predictive distribution, penalising BOTH\n\
+    over-dispersion and under-dispersion. A real CRPS has this property; a mislabelled interval\nwidth\
+    \ does not. If the quantity named `CRPS` can be reduced without limit by narrowing the\ninterval,\
+    \ then `lower == upper` (zero width, coverage 0) is its global optimum, and the gate\nwill faithfully\
+    \ drive the experiment to INTERVAL COLLAPSE while reporting an improvement.\nThat is a silent, total\
+    \ failure. Mandatory sanity output:\n  - print `Coverage90` and `Width90` for EVERY condition, alongside\
+    \ its CRPS;\n  - print a line `DEGENERACY_CHECK: width90=<float> coverage90=<float>` per condition;\n\
+    \  - if a condition yields Width90 near zero, or Coverage90 far below the 0.90 nominal, report\n \
+    \   it as DEGENERATE and never as the best condition.\n\n### CRPS DEFINITION — a width is NOT a CRPS\n\
+    CRPS MUST be a function of the realised outcome y_true. An expression that uses only the\npredicted\
+    \ bounds, such as `(upper - lower)/2`, is an INTERVAL WIDTH, not a CRPS: minimising it\nrewards the\
+    \ narrowest possible intervals regardless of whether they contain the outcome, which\nsilently inverts\
+    \ the entire study. Compute CRPS over a quantile grid as\n`2 * mean over quantile levels tau of the\
+    \ pinball loss of (y_true, q_tau)`, where the pinball\nloss is `max(tau*(y_true - q_tau), (tau-1)*(y_true\
+    \ - q_tau))`. Use a grid of at least 19 levels\n(0.05 to 0.95), not just the two interval endpoints.\
+    \ If you instead report a mean pinball loss,\nlabel it \"mean pinball loss\" and never \"CRPS\". Print\
+    \ which convention you used.\n\n### CRPS DEFINITION\nCRPS equals TWICE the integral of the pinball\
+    \ loss over the quantile levels. If you\ncompute a mean pinball loss, either multiply by 2 or label\
+    \ the number \"mean pinball\nloss\" — never print a mean pinball loss under the name \"CRPS\". Print\
+    \ which convention\nyou used.\n\n### REPORT THE WIDTH EXPONENT, NOT JUST ALPHA (hard requirement)\n\
+    An alpha value is meaningless unless the base it multiplies is stated, because the base\nmay already\
+    \ scale with D. The parameterisation-free quantity is the implied TOTAL\ninterval width exponent on\
+    \ D: the slope of log(interval width) against log(D). For every\ncondition that conditions on D, print\
+    \ that exponent, and print which base the alpha\nrefers to. Prefer the exponent over alpha when stating\
+    \ any result.\n\nAlso print, per D-decile, the multiplier that would have been CRPS-optimal for that\n\
+    decile, and the Spearman correlation of those optimal multipliers against decile index.\nA negative\
+    \ correlation combined with a gamma(D) constrained non-decreasing in D means\nthe constraint binds\
+    \ and the best achievable gamma under that form is a constant. That\nis a real finding about the parameterisation\
+    \ and must be printed, not hidden.\n\n### THE DIRECTION OF THE RESULT IS NOT KNOWN\nDo not write code\
+    \ that assumes divergence-conditioned widening helps. A null or negative\nresult is a perfectly good\
+    \ outcome and must be reported as-is. The selected alpha may\nlegitimately come out as zero. Never\
+    \ tune on the test window to rescue a direction.\n\n### AVAILABLE PACKAGES (host Python, verified)\n\
+    numpy 2.4, pandas 3.0, scipy 1.17, scikit-learn 1.9, matplotlib 3.11, pyarrow, torch 2.13\n(CPU/MPS),\
+    \ tqdm, plus the Python standard library.\nNOT AVAILABLE — importing any of these is an instant failure:\
+    \ torchvision, seaborn,\nstatsmodels, duckdb, datasets, transformers, tensorflow, jax, lightgbm, catboost.\n\
+    NOTE: `xgboost` 3.2.0 IS now installed and MAY be used (`from xgboost import XGBRegressor`).\nFor\
+    \ a random-forest baseline use `sklearn.ensemble.RandomForestRegressor`. Use the\nREGRESSOR variants,\
+    \ never the Classifier variants — the target `rrp_actual` is a\ncontinuous price in $/MWh, not a class\
+    \ label. Better still: remember that this is an\nINTERVAL-CALIBRATION study, not a point-forecast-accuracy\
+    \ study — the point forecast\n`ens_mean` is GIVEN in the data and does not need to be re-learned.\
+    \ Do not spend the\ntime budget training regressors when the question is how wide the intervals should\
+    \ be.\n\n### FORBIDDEN\n- Do NOT invent, guess, or construct any other dataset path. There is one\
+    \ path, above.\n- Do NOT generate synthetic or random predictors. The whole point of this study is\
+    \ that\n  the ensemble is real. `np.random.normal` as a data source is an instant failure.\n- Do NOT\
+    \ substitute an image/vision dataset. Do NOT import torchvision.\n- Do NOT write setup.py or requirements.txt.\
+    \ There is no network and no pip.\n- If the file cannot be read, PRINT THE ERROR AND EXIT NON-ZERO.\
+    \ Never fall back to\n  synthetic data — a silent synthetic fallback is worse than a crash.\n"
   dataset_guidance: "\n## THE DATASET FOR THIS STUDY — REAL DATA, ALREADY ON LOCAL DISK\n\nIGNORE any\
     \ other text in this prompt that mentions `/opt/datasets`, pre-cached\nCIFAR-10/CIFAR-100/MNIST/FashionMNIST/STL-10/SVHN,\
     \ torchvision, HuggingFace, or\n\"Tier 1 / pre-cached datasets\". That text is boilerplate from a\

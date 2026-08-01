@@ -1,0 +1,1700 @@
+diff --git a/researchclaw/pipeline/results_evidence.py b/researchclaw/pipeline/results_evidence.py
+new file mode 100644
+index 0000000..0aee322
+--- /dev/null
++++ b/researchclaw/pipeline/results_evidence.py
+@@ -0,0 +1,528 @@
++"""Execution-artefact reconciliation — the single source of truth for
++"did any experiment actually produce a number?".
++
++Principle (FAB-1)
++-----------------
++**A verifier must reconcile reported numbers against the experiment artefacts,
++never against the text it is verifying, and never against a log string that the
++failure path itself emits.**
++
++The 2026-07-31 fabrication incident had three proxies standing in for evidence:
++
++1. ``_paper_writing.py`` accepted ``>= 3`` occurrences of the regex
++   ``condition[=:]`` in raw sandbox *stdout* as proof that real metrics existed.
++   A crashed run prints ``Running condition: <name>`` before dying, so the
++   pipeline's own progress messages satisfied its own anti-fabrication guard.
++2. ``_analysis.py`` promoted the metrics of a refinement sandbox that exited
++   ``returncode=1`` into ``best_run.status = "completed"``.
++3. ``_review_publish.py`` then read that laundered summary and reported
++   ``has_real_data: true``, ``fabrication_suspected: false``, ``verdict:
++   Accept``.
++
++This module keys on the only artefacts that record what a process actually did:
++
++* ``stage-*/runs/*.json`` — ``status``, ``metrics``, ``timed_out``
++* ``stage-13*/refinement_log.json`` — per-iteration ``sandbox`` /
++  ``sandbox_after_fix`` entries carrying ``returncode``, ``metrics``,
++  ``timed_out`` (both fields are always written by
++  ``_execution.py::_execute_iterative_refine``).
++
++It never reads ``experiment_summary.json`` (a derived artefact), never reads
++paper text, and never pattern-matches log output.
++
++Outcome vocabulary
++------------------
++``success``
++    Process terminated normally (``status`` in :data:`_SUCCESS_STATUSES`, or
++    ``returncode == 0``) and did not time out.
++``degraded``
++    Timed out but emitted metrics.  A timeout is a *budget* outcome, not a
++    correctness failure, so its emitted numbers remain traceable to a process.
++``failed``
++    Non-zero exit, ``status: failed``, or a normal exit with no metrics at all.
++    **A non-zero exit never counts as evidence**, however many metric lines the
++    process printed before raising — the program's own contract broke, so the
++    condition set it claims to cover is unknowable.
++``simulated``
++    Synthetic data.  Never evidence.
++``unknown``
++    Artefact does not record a terminal outcome.  Never evidence.
++
++Only ``success`` and ``degraded`` executions that carry at least one finite,
++non-infrastructure metric value count as evidence.
++
++Scope boundary — provenance, NOT validity
++-----------------------------------------
++``has_real_metrics`` answers exactly one question: **did a process actually
++emit this number?**  It does not, and deliberately must not, answer *is the
++number meaningful?*  A run whose evaluator is nonsense will exit cleanly, emit
++finite metrics, and pass this module — correctly, because the numbers really
++were produced.
++
++This is not hypothetical.  The 2026-07-31 baseline evaluator
++(``stage-10/experiment/evaluation.py``) computed::
++
++    crps = (y_pred[:, 1] - y_pred[:, 0]) / 2   # the interval HALF-WIDTH
++
++with ``predict()`` returning ``np.array(X) * 1.0`` — so ``y_pred[:, 0]`` and
++``y_pred[:, 1]`` were *feature columns*, and no model regressed anything.
++Under ``metric_key: CRPS`` + ``metric_direction: minimize`` the global optimum
++of that objective is ``lower == upper``: zero-width intervals with coverage 0.
++``Coverage90`` was computed and printed but was not the adoption objective, so
++nothing penalised the collapse.
++
++Such a run would pass every check in this module.  **That is the intended
++division of labour, not a gap to close here.** Deciding that CRPS must be
++minimised *subject to* a coverage floor is authoring the experiment's
++evaluation — a research decision belonging in the experiment plan and the
++generated evaluator, not in an integrity gate.  A gate that silently invented
++an objective would be committing the same category error as the guard it
++replaced: substituting its own proxy for the thing it is meant to protect.
++
++State the guarantee precisely when quoting it: *every reported number traces to
++a process that produced it* — never *the results are correct*.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import math
++import re
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++logger = logging.getLogger(__name__)
++
++__all__ = [
++    "ExecutionRecord",
++    "ResultsEvidence",
++    "collect_results_evidence",
++]
++
++# Exact, whole-token status values.  Compared with ``==`` after
++# ``strip().lower()`` — never with ``in`` against the raw string, because
++# substring matching is how this codebase produced its trap in the first place.
++_SUCCESS_STATUSES: frozenset[str] = frozenset(
++    {"completed", "complete", "done", "success", "succeeded", "ok", "passed"}
++)
++_FAILED_STATUSES: frozenset[str] = frozenset(
++    {"failed", "failure", "error", "errored", "crashed", "timeout", "timed_out"}
++)
++_SIMULATED_STATUSES: frozenset[str] = frozenset({"simulated", "synthetic", "mock"})
++_DEGRADED_STATUSES: frozenset[str] = frozenset({"partial"})
++
++# Infrastructure counters — real numbers, but not experimental results.
++# Compared case-insensitively against the *whole* metric key (or its last
++# path segment), never as a substring.
++_INFRA_METRIC_KEYS: frozenset[str] = frozenset(
++    k.lower()
++    for k in (
++        "elapsed_sec",
++        "total_elapsed_seconds",
++        "time_estimate",
++        "seed_count",
++        "n_seeds",
++        "time_budget_sec",
++        "condition_count",
++        "total_runs",
++        "total_conditions",
++        "total_metric_keys",
++        "stopped_early",
++        "training_steps",
++        "total_steps",
++        "batch_size",
++        "num_workers",
++        "total_params",
++        "max_epochs",
++        "num_seeds",
++        "gpu_memory",
++    )
++)
++
++# "Cond/0/metric" and "Cond/metric"
++_PER_SEED_KEY = re.compile(r"^(?P<cond>.+)/(?P<seed>\d+)/(?P<metric>.+)$")
++_COND_KEY = re.compile(r"^(?P<cond>[^/]+)/(?P<metric>[^/]+)$")
++
++
++def _is_finite_number(value: Any) -> bool:
++    """True for a finite int/float that is not a bool."""
++    if isinstance(value, bool):
++        return False
++    if not isinstance(value, (int, float)):
++        return False
++    return math.isfinite(value)
++
++
++def _is_infra_key(key: str) -> bool:
++    """Whole-token infrastructure-key test (never a substring match)."""
++    lowered = key.strip().lower()
++    if lowered in _INFRA_METRIC_KEYS:
++        return True
++    tail = lowered.rsplit("/", 1)[-1]
++    return tail in _INFRA_METRIC_KEYS
++
++
++def _extract_metrics(metrics: Any) -> tuple[tuple[float, ...], tuple[str, ...]]:
++    """Return (finite result values, condition names) from a metrics mapping."""
++    if not isinstance(metrics, dict):
++        return (), ()
++    values: list[float] = []
++    conditions: set[str] = set()
++    for key, value in metrics.items():
++        if not isinstance(key, str):
++            continue
++        if _is_infra_key(key):
++            continue
++        if not _is_finite_number(value):
++            continue
++        values.append(float(value))
++        m = _PER_SEED_KEY.match(key) or _COND_KEY.match(key)
++        if m:
++            cond = m.group("cond").strip()
++            if cond and not _is_infra_key(cond):
++                conditions.add(cond)
++    return tuple(values), tuple(sorted(conditions))
++
++
++@dataclass(frozen=True)
++class ExecutionRecord:
++    """One process execution, as recorded by its own artefact."""
++
++    source: str
++    kind: str  # "run" | "refine_sandbox"
++    outcome: str  # success | degraded | failed | simulated | unknown
++    detail: str
++    metric_values: tuple[float, ...] = ()
++    conditions: tuple[str, ...] = ()
++
++    @property
++    def is_evidence(self) -> bool:
++        """True only when a terminating process actually emitted a number."""
++        return self.outcome in ("success", "degraded") and bool(self.metric_values)
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "source": self.source,
++            "kind": self.kind,
++            "outcome": self.outcome,
++            "detail": self.detail,
++            "finite_metric_count": len(self.metric_values),
++            "conditions": list(self.conditions),
++            "is_evidence": self.is_evidence,
++        }
++
++
++@dataclass
++class ResultsEvidence:
++    """Reconciliation verdict built purely from execution artefacts."""
++
++    run_dir: str = ""
++    executions: list[ExecutionRecord] = field(default_factory=list)
++
++    # -- basic views -------------------------------------------------------
++    @property
++    def is_authoritative(self) -> bool:
++        """True when at least one execution artefact was found.
++
++        With zero execution artefacts this module has nothing to say, and
++        callers must fall back to their previous behaviour rather than block
++        an execution path that does not record runs (e.g. purely theoretical
++        domains).  It never means "assume success".
++        """
++        return bool(self.executions)
++
++    @property
++    def supporting(self) -> list[ExecutionRecord]:
++        return [e for e in self.executions if e.is_evidence]
++
++    @property
++    def has_real_metrics(self) -> bool:
++        """The load-bearing predicate: did *any* terminating execution emit a
++        finite result value?"""
++        return bool(self.supporting)
++
++    @property
++    def finite_metric_values(self) -> tuple[float, ...]:
++        vals: list[float] = []
++        for e in self.supporting:
++            vals.extend(e.metric_values)
++        return tuple(vals)
++
++    @property
++    def verified_conditions(self) -> tuple[str, ...]:
++        names: set[str] = set()
++        for e in self.supporting:
++            names.update(e.conditions)
++        return tuple(sorted(names))
++
++    @property
++    def unverified_conditions(self) -> tuple[str, ...]:
++        """Conditions OBSERVED in a non-evidence execution's metrics.
++
++        These are the dangerous ones: a crashed process printed numbers for
++        them, so they look real in stdout and in any summary derived from it.
++
++        **This is not the full set of unsupported conditions, and must never be
++        read as one.** It can only name conditions that emitted at least one
++        metric key. A condition that was declared and then never ran at all
++        emits nothing, so it is invisible here.
++
++        In the 2026-07-31 run, five conditions were registered
++        (``NoWidening`` plus four wideners) and only ``NoWidening`` ever emitted
++        a metric — it crashed on condition 2 of 5. This property therefore
++        reports exactly ``("NoWidening",)``, and a reader who took that as "one
++        condition is questionable" would miss that **four more were declared and
++        never executed**.
++
++        Establishing the declared set requires the experiment plan/spec, not the
++        execution record, so it is deliberately out of scope here: comparing a
++        paper's claimed conditions against the declared set is a separate check
++        that must be built explicitly rather than inferred from this field.
++        """
++        claimed: set[str] = set()
++        for e in self.executions:
++            if not e.is_evidence:
++                claimed.update(e.conditions)
++        return tuple(sorted(claimed - set(self.verified_conditions)))
++
++    @property
++    def orphan_metric_count(self) -> int:
++        """Finite values emitted by executions that did NOT terminate cleanly."""
++        return sum(len(e.metric_values) for e in self.executions if not e.is_evidence)
++
++    # -- reporting ---------------------------------------------------------
++    def blocking_reasons(self) -> list[str]:
++        """Human-readable reasons this run cannot support reported numbers."""
++        if not self.is_authoritative:
++            return []
++        if self.has_real_metrics:
++            return []
++        reasons: list[str] = []
++        n = len(self.executions)
++        reasons.append(
++            f"No execution produced a finite metric: {n} execution artefact(s) "
++            f"examined, 0 terminated successfully with results."
++        )
++        for e in self.executions:
++            reasons.append(f"  {e.source}: {e.outcome} — {e.detail}")
++        if self.orphan_metric_count:
++            reasons.append(
++                f"{self.orphan_metric_count} metric value(s) were emitted by "
++                f"executions that did not terminate cleanly; they are NOT "
++                f"verified results and must not appear in a paper."
++            )
++        if self.unverified_conditions:
++            reasons.append(
++                "Conditions named only by failed executions: "
++                + ", ".join(self.unverified_conditions)
++            )
++        return reasons
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "run_dir": self.run_dir,
++            "authoritative": self.is_authoritative,
++            "has_real_metrics": self.has_real_metrics,
++            "executions_examined": len(self.executions),
++            "executions_supporting": len(self.supporting),
++            "verified_conditions": list(self.verified_conditions),
++            "unverified_conditions": list(self.unverified_conditions),
++            "finite_metric_count": len(self.finite_metric_values),
++            "orphan_metric_count": self.orphan_metric_count,
++            "blocking_reasons": self.blocking_reasons(),
++            "executions": [e.to_dict() for e in self.executions],
++        }
++
++
++def _classify_run_json(path: Path, payload: dict[str, Any]) -> ExecutionRecord:
++    values, conditions = _extract_metrics(payload.get("metrics"))
++    raw_status = payload.get("status")
++    status = str(raw_status).strip().lower() if raw_status is not None else ""
++    timed_out = bool(payload.get("timed_out"))
++
++    if status in _SIMULATED_STATUSES:
++        return ExecutionRecord(
++            source=path.name,
++            kind="run",
++            outcome="simulated",
++            detail=f"status={raw_status!r} — synthetic data, never evidence",
++        )
++    if status in _FAILED_STATUSES:
++        return ExecutionRecord(
++            source=path.name,
++            kind="run",
++            outcome="failed",
++            detail=(
++                f"status={raw_status!r}, {len(values)} finite metric(s) recorded "
++                f"before termination"
++            ),
++            metric_values=values,
++            conditions=conditions,
++        )
++    if status in _DEGRADED_STATUSES or (timed_out and values):
++        return ExecutionRecord(
++            source=path.name,
++            kind="run",
++            outcome="degraded" if values else "failed",
++            detail=f"status={raw_status!r}, timed_out={timed_out}",
++            metric_values=values,
++            conditions=conditions,
++        )
++    if status in _SUCCESS_STATUSES:
++        if not values:
++            return ExecutionRecord(
++                source=path.name,
++                kind="run",
++                outcome="failed",
++                detail=(
++                    f"status={raw_status!r} but metrics are empty — a clean exit "
++                    f"with no metrics is not a result"
++                ),
++            )
++        return ExecutionRecord(
++            source=path.name,
++            kind="run",
++            outcome="success",
++            detail=f"status={raw_status!r}, {len(values)} finite metric(s)",
++            metric_values=values,
++            conditions=conditions,
++        )
++    return ExecutionRecord(
++        source=path.name,
++        kind="run",
++        outcome="unknown",
++        detail=f"status={raw_status!r} is not a recognised terminal outcome",
++        metric_values=values,
++        conditions=conditions,
++    )
++
++
++def _classify_sandbox_entry(
++    source: str, entry: dict[str, Any]
++) -> ExecutionRecord | None:
++    values, conditions = _extract_metrics(entry.get("metrics"))
++    returncode = entry.get("returncode")
++    timed_out = bool(entry.get("timed_out"))
++    has_any_field = bool(entry)
++    if not has_any_field:
++        return None
++
++    if returncode is None:
++        return ExecutionRecord(
++            source=source,
++            kind="refine_sandbox",
++            outcome="unknown",
++            detail="no returncode recorded — cannot establish terminal outcome",
++            metric_values=values,
++            conditions=conditions,
++        )
++    try:
++        rc = int(returncode)
++    except (TypeError, ValueError):
++        return ExecutionRecord(
++            source=source,
++            kind="refine_sandbox",
++            outcome="unknown",
++            detail=f"returncode={returncode!r} is not an integer",
++            metric_values=values,
++            conditions=conditions,
++        )
++
++    if rc != 0:
++        if timed_out and values:
++            return ExecutionRecord(
++                source=source,
++                kind="refine_sandbox",
++                outcome="degraded",
++                detail=f"returncode={rc} via timeout, {len(values)} finite metric(s)",
++                metric_values=values,
++                conditions=conditions,
++            )
++        return ExecutionRecord(
++            source=source,
++            kind="refine_sandbox",
++            outcome="failed",
++            detail=(
++                f"returncode={rc}, {len(values)} finite metric(s) emitted before "
++                f"the process died"
++            ),
++            metric_values=values,
++            conditions=conditions,
++        )
++    if not values:
++        return ExecutionRecord(
++            source=source,
++            kind="refine_sandbox",
++            outcome="failed",
++            detail="returncode=0 but no finite metrics emitted",
++        )
++    return ExecutionRecord(
++        source=source,
++        kind="refine_sandbox",
++        outcome="degraded" if timed_out else "success",
++        detail=f"returncode=0, timed_out={timed_out}, {len(values)} finite metric(s)",
++        metric_values=values,
++        conditions=conditions,
++    )
++
++
++def collect_results_evidence(run_dir: Path) -> ResultsEvidence:
++    """Build a :class:`ResultsEvidence` for *run_dir* from execution artefacts only."""
++    run_dir = Path(run_dir)
++    evidence = ResultsEvidence(run_dir=run_dir.name)
++
++    for runs_dir in sorted(run_dir.glob("stage-*/runs")):
++        for run_file in sorted(runs_dir.glob("*.json")):
++            if run_file.name == "results.json":
++                continue  # no terminal-outcome field; run-N.json covers it
++            try:
++                payload = json.loads(run_file.read_text(encoding="utf-8"))
++            except (json.JSONDecodeError, OSError):
++                logger.debug("results_evidence: unreadable %s", run_file)
++                continue
++            if not isinstance(payload, dict):
++                continue
++            rel = f"{runs_dir.parent.name}/runs/{run_file.name}"
++            record = _classify_run_json(run_file, payload)
++            evidence.executions.append(
++                ExecutionRecord(
++                    source=rel,
++                    kind=record.kind,
++                    outcome=record.outcome,
++                    detail=record.detail,
++                    metric_values=record.metric_values,
++                    conditions=record.conditions,
++                )
++            )
++
++    for log_path in sorted(run_dir.glob("stage-13*/refinement_log.json")):
++        try:
++            log_data = json.loads(log_path.read_text(encoding="utf-8"))
++        except (json.JSONDecodeError, OSError):
++            logger.debug("results_evidence: unreadable %s", log_path)
++            continue
++        if not isinstance(log_data, dict):
++            continue
++        for iteration in log_data.get("iterations", []) or []:
++            if not isinstance(iteration, dict):
++                continue
++            version = str(iteration.get("version_dir", "?")).rstrip("/")
++            for key in ("sandbox", "sandbox_after_fix"):
++                entry = iteration.get(key)
++                if not isinstance(entry, dict) or not entry:
++                    continue
++                source = f"{log_path.parent.name}/{version}/{key}"
++                record = _classify_sandbox_entry(source, entry)
++                if record is not None:
++                    evidence.executions.append(record)
++
++    logger.info(
++        "results_evidence(%s): %d execution(s), %d supporting, has_real_metrics=%s",
++        evidence.run_dir,
++        len(evidence.executions),
++        len(evidence.supporting),
++        evidence.has_real_metrics,
++    )
++    return evidence
+diff --git a/researchclaw/pipeline/stage_impls/_analysis.py b/researchclaw/pipeline/stage_impls/_analysis.py
+index c991fd6..106268f 100644
+--- a/researchclaw/pipeline/stage_impls/_analysis.py
++++ b/researchclaw/pipeline/stage_impls/_analysis.py
+@@ -161,10 +161,20 @@ def _execute_result_analysis(
+                     if _new_summary:
+                         exp_data["metrics_summary"] = _new_summary
+                         # Also update best_run with refinement data
++                        # FAB-1: report the refinement sandbox's ACTUAL terminal
++                        # outcome.  Hardcoding "completed" here stamped a clean
++                        # status onto a process that exited non-zero, which is
++                        # what let Stage 20 certify a crashed run as real data.
++                        _sbx_rc = _sbx.get("returncode")
+                         exp_data["best_run"] = {
+                             "run_id": "iterative-refine-best",
+                             "task_id": "sandbox-main",
+-                            "status": "completed",
++                            "status": (
++                                "completed" if _sbx_rc == 0
++                                else "partial" if _sbx.get("timed_out")
++                                else "failed"
++                            ),
++                            "returncode": _sbx_rc,
+                             "metrics": {
+                                 k: v for k, v in _refine_metrics.items()
+                             },
+diff --git a/researchclaw/pipeline/stage_impls/_paper_writing.py b/researchclaw/pipeline/stage_impls/_paper_writing.py
+index afaaf67..de4eb31 100644
+--- a/researchclaw/pipeline/stage_impls/_paper_writing.py
++++ b/researchclaw/pipeline/stage_impls/_paper_writing.py
+@@ -142,6 +142,111 @@ def _execute_paper_outline(
+     )
+ 
+ 
++def _collect_plan_condition_status(run_dir: Path) -> dict[str, Any] | None:
++    """FAB-2: reconcile the PLAN's declared conditions against what scored.
++
++    Returns ``None`` when there is no plan to reconcile against — absence of a
++    plan is never evidence that a condition was skipped.
++
++    Two deliberate choices:
++
++    * **The scored set comes from the AUTHORITATIVE refinement log only, via
++      ``_read_prior_artifact``.** A run can carry three logs (``stage-13/``,
++      ``stage-13_v1/``, ``stage-13_v2/``), all reporting
++      ``best_version: "experiment/"``, and they disagree: on run 4 the registries
++      are 5, 5 and **6** conditions and ``NoWidening`` scores in a different
++      iteration of each. On rollback the *completed* cycle is archived to
++      ``stage-13_vN`` and the new cycle takes the bare name, so ``stage-13`` is
++      the newest — which ``_read_prior_artifact``'s existing sort key already
++      resolves to. Note ``sorted(glob("stage-13*"))[-1]`` picks ``stage-13_v2``:
++      lexicographically last, chronologically *middle*.
++
++      A union across all cycles was the first design here and is **wrong**: if an
++      archived cycle scored the proposed method and the current one did not, the
++      paper is still written from the current cycle and its numbers still have no
++      source. Union would fail open in exactly the direction that matters.
++    * **The matching logic is imported, not re-implemented.** ``_plan_vs_scored``
++      and ``_declared_conditions`` live in ``_execution.py``; a second copy would
++      drift from the field it explains.
++    """
++    plan_path = run_dir / "stage-09" / "exp_plan.yaml"
++    if not plan_path.is_file():
++        return None
++    try:
++        plan_text = plan_path.read_text(encoding="utf-8")
++    except OSError:
++        return None
++    # FAB-2: deliberately NOT wrapped in try/except ImportError.
++    #
++    # The first version of this caught ImportError, logged a warning and
++    # returned None — the same value that means "no plan, nothing to check".
++    # On a tree carrying patch 006 without 007 that made the anti-fabrication
++    # guard **silently disable itself**: no exception, no halted stage, FAB-2
++    # simply never fires and the paper is drafted, with one WARNING line as the
++    # only trace.  That is fail-OPEN in a guard's own error handling — the exact
++    # property rejected in the union design three commits earlier.
++    #
++    # A missing dependency is a deployment error, not a runtime condition. Let
++    # it propagate: the runner marks PAPER_DRAFT failed with an actionable
++    # message, which fails SAFE. Note an import-level smoke test will not catch
++    # a partially-applied tree, because this import is function-local by design
++    # (it breaks a module-level cycle) — apply 006 and 007 together or neither.
++    from researchclaw.pipeline.stage_impls._execution import (
++        _condition_coverage,
++        _declared_conditions,
++        _describe_plan_gap,
++        _plan_vs_scored,
++    )
++
++    declared = _declared_conditions(plan_text)
++    if not declared:
++        return None
++
++    stdout_parts: list[str] = []
++    merged_metrics: dict[str, Any] = {}
++    log_text = _read_prior_artifact(run_dir, "refinement_log.json")
++    if log_text:
++        log_data = _safe_json_loads(log_text, {})
++        if isinstance(log_data, dict):
++            for iteration in log_data.get("iterations", []) or []:
++                if not isinstance(iteration, dict):
++                    continue
++                for key in ("sandbox", "sandbox_after_fix"):
++                    entry = iteration.get(key)
++                    if not isinstance(entry, dict):
++                        continue
++                    if entry.get("stdout"):
++                        stdout_parts.append(str(entry["stdout"]))
++                    if isinstance(entry.get("metrics"), dict):
++                        merged_metrics.update(entry["metrics"])
++
++    runs_dir_str = _read_prior_artifact(run_dir, "runs/")
++    if runs_dir_str:
++        for run_file in sorted(Path(runs_dir_str).glob("*.json")):
++            if run_file.name == "results.json":
++                continue
++            try:
++                payload = json.loads(run_file.read_text(encoding="utf-8"))
++            except (json.JSONDecodeError, OSError):
++                continue
++            if not isinstance(payload, dict):
++                continue
++            if payload.get("status") == "simulated":
++                continue
++            if payload.get("stdout"):
++                stdout_parts.append(str(payload["stdout"]))
++            if isinstance(payload.get("metrics"), dict):
++                merged_metrics.update(payload["metrics"])
++
++    coverage = _condition_coverage("\n".join(stdout_parts), merged_metrics)
++    status = _plan_vs_scored(declared, coverage)
++    status["gap_description"] = _describe_plan_gap(status)
++    status["scored_source"] = (
++        "authoritative refinement_log.json + runs/ (via _read_prior_artifact)"
++    )
++    return status
++
++
+ def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
+     """Collect raw experiment metric lines from stdout for paper writing.
+ 
+@@ -1285,6 +1390,15 @@ def _execute_paper_draft(
+             exp_summary_text = _read_prior_artifact(run_dir, "experiment_summary.json")
+     exp_metrics_instruction = ""
+     has_real_metrics = False
++    # FAB-1: Reconcile against execution artefacts (runs/*.json, refinement
++    # sandbox returncodes) BEFORE anything derived from them is consulted.
++    # experiment_summary.json is a derived artefact and can carry metrics that
++    # a crashed process emitted; only this tells us whether a process actually
++    # terminated with results.
++    from researchclaw.pipeline.results_evidence import (
++        collect_results_evidence as _collect_results_evidence,
++    )
++    _results_evidence = _collect_results_evidence(run_dir)
+     _verified_registry = None  # Phase 1: anti-fabrication verified data registry
+     # BUG-108: Load refinement_log so VerifiedRegistry has per-iteration metrics
+     _refinement_log_for_vr: dict | None = None
+@@ -1327,16 +1441,35 @@ def _execute_paper_draft(
+     # Collect raw experiment stdout metrics as hard constraint for the paper
+     raw_metrics_block, _has_parsed_metrics = _collect_raw_experiment_metrics(run_dir)
+     if raw_metrics_block:
+-        # BUG-23: Raw stdout alone is not sufficient — require either
+-        # metrics_summary data, parsed metrics from run JSONs,
+-        # OR at least 3 condition= patterns in raw block
+-        _has_condition_pattern = len(re.findall(
+-            r"condition[=:]", raw_metrics_block, re.IGNORECASE
+-        )) >= 3
+-        if has_real_metrics or _has_parsed_metrics or _has_condition_pattern:
+-            has_real_metrics = True
++        # FAB-1: Raw stdout is NEVER evidence.  The previous rule here accepted
++        # >= 3 matches of ``condition[=:]`` in raw stdout as proof of real
++        # metrics — but a crashed run prints "Running condition: <name>" before
++        # dying, so the pipeline's own progress messages satisfied its own
++        # anti-fabrication guard.  A guard must key on the artefact it protects,
++        # not on a proxy that the failure path itself produces.
+         exp_metrics_instruction += raw_metrics_block
+ 
++    # FAB-1: The execution artefacts are authoritative in BOTH directions.
++    # ``has_real_metrics`` may only be True when some execution terminated
++    # cleanly (or timed out) AND emitted at least one finite result value.
++    if _results_evidence.is_authoritative:
++        if has_real_metrics and not _results_evidence.has_real_metrics:
++            logger.error(
++                "FAB-1: experiment_summary reports metrics but NO execution "
++                "produced them. Overriding has_real_metrics to False.\n%s",
++                "\n".join(_results_evidence.blocking_reasons()),
++            )
++        has_real_metrics = _results_evidence.has_real_metrics
++    elif has_real_metrics or _has_parsed_metrics:
++        # No execution artefacts at all (e.g. externally supplied results).
++        # Fall back to the derived-artefact signal, but say so.
++        logger.warning(
++            "FAB-1: no execution artefacts found under %s — falling back to "
++            "derived experiment_summary/run metrics for has_real_metrics",
++            run_dir,
++        )
++        has_real_metrics = True
++
+     # R18-1 + R19-6: Inject paired statistical comparisons AND condition summaries
+     if exp_summary_text:
+         exp_summary_parsed = _safe_json_loads(exp_summary_text, {})
+@@ -1617,24 +1750,42 @@ def _execute_paper_draft(
+         config.research.topic, config.research.domains
+     )
+     _empirical_domains = {"ml", "engineering", "biology", "chemistry"}
++    # FAB-1: Always persist the reconciliation so the block (or the pass) is
++    # auditable from the run directory alone.
++    (stage_dir / "results_evidence.json").write_text(
++        json.dumps(_results_evidence.to_dict(), indent=2), encoding="utf-8"
++    )
+     if not has_real_metrics and not _is_lit_first:
+         if _domain_id in _empirical_domains:
++            _block_reasons = _results_evidence.blocking_reasons()
+             logger.error(
+-                "BLOCKED: Cannot write paper — experiment produced NO metrics. "
+-                "The pipeline will not fabricate results."
++                "BLOCKED: Cannot write paper — no execution produced a finite "
++                "metric. The pipeline will not fabricate results.\n%s",
++                "\n".join(_block_reasons),
+             )
+             (stage_dir / "paper_draft.md").write_text(
+                 "# Paper Draft Blocked\n\n"
+-                "**Reason**: Experiment stage produced no metrics (status: failed/timeout). "
++                "**Reason**: No experiment execution terminated with results. "
+                 "Cannot write a paper without real experimental data.\n\n"
+-                "**Action Required**: Fix experiment execution or increase time_budget_sec.",
++                + (
++                    "**Evidence (`results_evidence.json`)**:\n\n```\n"
++                    + "\n".join(_block_reasons)
++                    + "\n```\n\n"
++                    if _block_reasons
++                    else ""
++                )
++                + "**Action Required**: Fix experiment execution or increase time_budget_sec.",
+                 encoding="utf-8",
+             )
+             return StageResult(
+                 stage=Stage.PAPER_DRAFT,
+                 status=StageStatus.FAILED,
+-                artifacts=("paper_draft.md",),
+-                evidence_refs=(),
++                artifacts=("paper_draft.md", "results_evidence.json"),
++                evidence_refs=("stage-17/results_evidence.json",),
++                error=(
++                    "No execution produced a finite metric — refusing to draft a "
++                    "paper (see stage-17/results_evidence.json)"
++                ),
+             )
+         else:
+             logger.warning(
+@@ -1643,6 +1794,63 @@ def _execute_paper_draft(
+                 _domain_name,
+             )
+ 
++    # FAB-2: HARD BLOCK — the paper's SUBJECT never ran.
++    #
++    # FAB-1 asks "did ANY process emit a number".  That trigger is too narrow:
++    # a run where 1 of N conditions scored passes it, and the paper may then
++    # tabulate all N.  That is the 2026-07-31 incident's own shape — 8 declared,
++    # 5 registered, 1 scored, 5+ tabulated, with the fabricated baseline row
++    # (UnconditionalQuantileAggregation) being a condition the plan declared and
++    # the code never registered.
++    #
++    # Softer treatments are known to fail: run 4 already recorded
++    # `final_mode: "preliminary_study"` and the writing stage fabricated a
++    # 4.51-point win with t-tests anyway.  The flag was set and ignored.
++    # If the paper's subject never ran, there is no paper.
++    #
++    # FAIL CLOSED: block only on PROVEN absence.  `correspondence == "ok"` means
++    # the plan and code namespaces reconciled; on "unresolved" an unscored
++    # proposed method is a NAMING finding, and blocking there would halt every
++    # run with a name mismatch.  "no_plan" never blocks.
++    _plan_status: dict[str, Any] | None = None
++    if not _is_lit_first and _domain_id in _empirical_domains:
++        _plan_status = _collect_plan_condition_status(run_dir)
++    if _plan_status is not None:
++        (stage_dir / "plan_condition_status.json").write_text(
++            json.dumps(_plan_status, indent=2, default=str), encoding="utf-8"
++        )
++        if (
++            _plan_status.get("correspondence") == "ok"
++            and _plan_status.get("proposed_methods")
++            and not _plan_status.get("any_proposed_method_scored")
++        ):
++            _gap = _plan_status.get("gap_description") or (
++                "No declared proposed method produced metrics."
++            )
++            logger.error("BLOCKED (FAB-2): %s", _gap)
++            (stage_dir / "paper_draft.md").write_text(
++                "# Paper Draft Blocked\n\n"
++                "**Reason**: the paper's subject never ran. No proposed method "
++                "declared in the experiment plan produced any metric.\n\n"
++                f"**Finding**: {_gap}\n\n"
++                "**Evidence**: `plan_condition_status.json` "
++                "(declared set from `stage-09/exp_plan.yaml`, scored set from "
++                "the execution artefacts).\n\n"
++                "**Action Required**: make the proposed method run and score, "
++                "or change the plan to declare what is actually being tested.",
++                encoding="utf-8",
++            )
++            return StageResult(
++                stage=Stage.PAPER_DRAFT,
++                status=StageStatus.FAILED,
++                artifacts=("paper_draft.md", "plan_condition_status.json"),
++                evidence_refs=("stage-17/plan_condition_status.json",),
++                error=(
++                    "No declared proposed method produced a metric — refusing to "
++                    "draft a paper (see stage-17/plan_condition_status.json)"
++                ),
++            )
++
+     # R11-5: Experiment quality minimum threshold before paper writing
+     # Parse analysis.md for quality rating and condition completeness
+     analysis_text = _read_best_analysis(run_dir)
+diff --git a/researchclaw/pipeline/stage_impls/_review_publish.py b/researchclaw/pipeline/stage_impls/_review_publish.py
+index 1bb5db9..7d77fd2 100644
+--- a/researchclaw/pipeline/stage_impls/_review_publish.py
++++ b/researchclaw/pipeline/stage_impls/_review_publish.py
+@@ -379,6 +379,15 @@ def _execute_quality_gate(
+     revised = _read_prior_artifact(run_dir, "paper_revised.md") or ""
+     report: dict[str, Any] | None = None
+ 
++    # FAB-1: Reconcile against the EXECUTION artefacts first.  A verifier that
++    # reads its answer out of the artefact it is verifying (the paper text) or
++    # out of a summary derived from a crashed process is not a verifier.
++    from researchclaw.pipeline.results_evidence import (
++        collect_results_evidence as _collect_results_evidence,
++    )
++    _evidence = _collect_results_evidence(run_dir)
++    _no_results = _evidence.is_authoritative and not _evidence.has_real_metrics
++
+     # BUG-25 + BUG-180: Load the RICHEST experiment summary for cross-checking.
+     # _read_prior_artifact returns the first match in reverse-sorted order,
+     # which may be a repair stage with 0 conditions.  Instead, scan all
+@@ -432,6 +441,13 @@ def _execute_quality_gate(
+         if _best_richness > 0:
+             _exp_failed = False
+ 
++    # FAB-1: condition_summaries can be populated from a process that exited
++    # non-zero (see _analysis.py, which stamps status "completed" on refinement
++    # metrics regardless of returncode).  The execution artefacts override every
++    # heuristic above, in both directions.
++    if _evidence.is_authoritative:
++        _exp_failed = _no_results
++
+     if llm is not None:
+         _pm = prompts or PromptManager()
+         # IMP-33: Evaluate the full paper instead of truncating to 12K chars.
+@@ -496,9 +512,27 @@ def _execute_quality_gate(
+             )
+     if report is None:
+         report = _default_quality_report(config.research.quality_threshold)
++    # FAB-1: "Accept" is impossible when no condition produced a finite metric.
++    # This is not a cap on an LLM opinion — it is an arithmetic fact about the
++    # run directory, so it overrides the model's verdict outright.
++    if _no_results:
++        report["score_1_to_10"] = 1.0
++        report["verdict"] = "reject"
++        report["fabrication_block"] = True
++        report.setdefault("weaknesses", []).insert(
++            0,
++            "FAB-1: no experiment execution produced a finite metric value — "
++            "every numerical result in this paper is unsupported by any "
++            "artefact. See stage-20/results_evidence.json.",
++        )
++        logger.error(
++            "FAB-1: QUALITY GATE forced to reject — no execution produced a "
++            "finite metric.\n%s",
++            "\n".join(_evidence.blocking_reasons()),
++        )
+     report.setdefault("generated", _utcnow_iso())
+-    (stage_dir / "quality_report.json").write_text(
+-        json.dumps(report, indent=2), encoding="utf-8"
++    (stage_dir / "results_evidence.json").write_text(
++        json.dumps(_evidence.to_dict(), indent=2), encoding="utf-8"
+     )
+ 
+     # T2.1: Enforce quality gate — fail if score below threshold
+@@ -551,6 +585,26 @@ def _execute_quality_gate(
+     _fabrication_info["fabrication_suspected"] = (
+         _exp_failed and not _fabrication_info["has_real_data"]
+     )
++    # FAB-1: everything above is derived from experiment_summary.json, which a
++    # crashed process can populate.  Reconcile it against the execution record:
++    # if no process terminated with results then there IS no real data, and any
++    # number in the paper is fabricated — regardless of what the summary says.
++    if _evidence.is_authoritative:
++        _fabrication_info["evidence"] = _evidence.to_dict()
++        _fabrication_info["summary_derived_values"] = list(
++            _fabrication_info["real_metric_values"]
++        )
++        _fabrication_info["real_metric_values"] = [
++            round(v, 4) for v in _evidence.finite_metric_values
++        ]
++        _fabrication_info["has_real_data"] = _evidence.has_real_metrics
++        _fabrication_info["fabrication_suspected"] = _no_results
++        _fabrication_info["experiment_failed"] = _exp_failed
++        _fabrication_info["unverified_conditions"] = list(
++            _evidence.unverified_conditions
++        )
++        if _no_results:
++            _fabrication_info["blocking_reasons"] = _evidence.blocking_reasons()
+     # Phase 1: Enhanced fabrication detection via VerifiedRegistry
+     # BUG-108: Also pass refinement_log so NaN best_metric is properly handled
+     _rl20_candidates = sorted(run_dir.glob("stage-13*/refinement_log.json"), reverse=True)
+@@ -565,14 +619,72 @@ def _execute_quality_gate(
+         from researchclaw.pipeline.verified_registry import VerifiedRegistry as _VR20
+         _vr20 = _VR20.from_run_dir(run_dir, metric_direction=config.experiment.metric_direction, best_only=True) if isinstance(_exp_summary, dict) else None
+         if _vr20:
++            _fabrication_info["registry_values_count"] = len(_vr20.values)
++            _fabrication_info["registry_conditions"] = sorted(_vr20.condition_names)
+             _fabrication_info["verified_values_count"] = len(_vr20.values)
+             _fabrication_info["verified_conditions"] = sorted(_vr20.condition_names)
+     except Exception:
+         pass
++    # FAB-1: The VerifiedRegistry is built from experiment_summary.json, so its
++    # counts inherit that artefact's laundering.  "Verified" must mean traced to
++    # an execution that terminated with results — nothing else.
++    if _evidence.is_authoritative:
++        _fabrication_info["verified_values_count"] = len(
++            _evidence.finite_metric_values
++        )
++        _fabrication_info["verified_conditions"] = list(
++            _evidence.verified_conditions
++        )
+     (stage_dir / "fabrication_flags.json").write_text(
+         json.dumps(_fabrication_info, indent=2), encoding="utf-8"
+     )
+ 
++    # FAB-1: A paper cannot be "Accept"ed while its own fabrication flag is
++    # raised.  This also covers runs with NO execution artefacts at all, where
++    # the evidence module deliberately stays silent: the LLM's verdict used to
++    # survive alongside `fabrication_suspected: true`.
++    if _fabrication_info.get("fabrication_suspected") and str(
++        report.get("verdict", "")
++    ).strip().lower() in ("accept", "accepted", "proceed"):
++        logger.error(
++            "FAB-1: downgrading verdict %r to 'revise' — fabrication_suspected "
++            "is set (has_real_data=%s)",
++            report.get("verdict"),
++            _fabrication_info.get("has_real_data"),
++        )
++        report["verdict"] = "revise"
++        report["verdict_downgraded_by"] = "FAB-1 fabrication_suspected"
++        report.setdefault("weaknesses", []).insert(
++            0,
++            "FAB-1: fabrication suspected — no verified metric values back the "
++            "reported results; 'Accept' is not available.",
++        )
++        verdict = report["verdict"]
++    (stage_dir / "quality_report.json").write_text(
++        json.dumps(report, indent=2), encoding="utf-8"
++    )
++
++    # FAB-1: A fabrication block is not degradable.  graceful_degradation exists
++    # to let a merely-weak paper through; it must never launder a paper whose
++    # numbers have no source.
++    if _no_results:
++        return StageResult(
++            stage=Stage.QUALITY_GATE,
++            status=StageStatus.FAILED,
++            artifacts=(
++                "quality_report.json",
++                "fabrication_flags.json",
++                "results_evidence.json",
++            ),
++            evidence_refs=("stage-20/results_evidence.json",),
++            decision="fabrication_block",
++            error=(
++                "FAB-1: no experiment execution produced a finite metric — "
++                "reported results are unsupported by any artefact "
++                "(see stage-20/results_evidence.json)"
++            ),
++        )
++
+     if isinstance(score, (int, float)) and score < threshold:
+         if config.research.graceful_degradation:
+             logger.warning(
+diff --git a/tests/test_plan_condition_block.py b/tests/test_plan_condition_block.py
+new file mode 100644
+index 0000000..95494ff
+--- /dev/null
++++ b/tests/test_plan_condition_block.py
+@@ -0,0 +1,232 @@
++"""FAB-2: PAPER_DRAFT must block when the paper's SUBJECT never ran.
++
++FAB-1 asks "did ANY process emit a number".  That trigger is too narrow: a run
++where 1 of N conditions scored passes it, and the paper may then tabulate all N.
++That is the 2026-07-31 incident's own shape — 8 conditions declared in
++``stage-09/exp_plan.yaml``, 5 registered, 1 scored, 5+ tabulated, with the
++fabricated baseline row (``UnconditionalQuantileAggregation``) being a condition
++the plan declared and the code never registered.
++
++The block is FAIL-CLOSED: it fires only on *proven* absence.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++import yaml
++
++from researchclaw.pipeline.stage_impls._paper_writing import (
++    _collect_plan_condition_status,
++)
++
++
++def _blocks(status: dict | None) -> bool:
++    """The exact predicate stage 17 applies."""
++    if status is None:
++        return False
++    return bool(
++        status.get("correspondence") == "ok"
++        and status.get("proposed_methods")
++        and not status.get("any_proposed_method_scored")
++    )
++
++
++def _plan(tmp_path: Path, proposed: list[tuple[str, str]], ablations: list[tuple[str, str]]) -> None:
++    d = tmp_path / "stage-09"
++    d.mkdir(parents=True, exist_ok=True)
++    payload = {
++        "proposed_methods": [
++            {"name": n, "implementation_spec": {"class_name": c}} for n, c in proposed
++        ],
++        "ablations": [
++            {"name": n, "implementation_spec": {"class_name": c}} for n, c in ablations
++        ],
++        "baselines": ["UnconditionalQuantileAggregation"],
++    }
++    (d / "exp_plan.yaml").write_text(yaml.safe_dump(payload), encoding="utf-8")
++
++
++def _refine(tmp_path: Path, stage: str, registered: list[str], metrics: dict) -> None:
++    d = tmp_path / stage
++    d.mkdir(parents=True, exist_ok=True)
++    (d / "refinement_log.json").write_text(
++        json.dumps({
++            "iterations": [{
++                "version_dir": "experiment_v1/",
++                "sandbox": {
++                    "returncode": 0,
++                    "timed_out": False,
++                    "metrics": metrics,
++                    "stdout": "REGISTERED_CONDITIONS: " + ", ".join(registered),
++                },
++            }],
++        }),
++        encoding="utf-8",
++    )
++
++
++# ---------------------------------------------------------------------------
++# Fires on proven absence
++# ---------------------------------------------------------------------------
++
++
++def test_blocks_when_only_the_ablation_scored(tmp_path):
++    """The residual FAB-1 leaves open: 1 of N scored, and it isn't the subject."""
++    _plan(
++        tmp_path,
++        proposed=[("DivergenceConditionedWidening", "DivergenceConditionedWidener")],
++        ablations=[("NoWidening", "NoWidening")],
++    )
++    _refine(
++        tmp_path,
++        "stage-13",
++        registered=["NoWidening", "DivergenceConditionedWidener"],
++        metrics={"NoWidening/CRPS": 139.48},
++    )
++    status = _collect_plan_condition_status(tmp_path)
++    assert status["correspondence"] == "ok"
++    assert status["any_proposed_method_scored"] is False
++    assert _blocks(status) is True
++    # A BARE-STRING baseline entry must still be classified. `baselines:` is a
++    # list of plain strings, not mappings, and a dict-only parse silently drops
++    # them — dropping exactly the entries most at risk. On the real run this is
++    # the fabricated baseline row itself. Asserted here rather than only in the
++    # reference-run test below, which skips whenever `artifacts/` is absent
++    # (it is untracked, so it is absent in every clean checkout and in CI).
++    assert "UnconditionalQuantileAggregation" in status["not_registered"]
++
++
++# ---------------------------------------------------------------------------
++# Fail-open: never block on UNKNOWN
++# ---------------------------------------------------------------------------
++
++
++def test_no_plan_never_blocks(tmp_path):
++    """Absence of a plan is not evidence a condition was skipped."""
++    _refine(tmp_path, "stage-13", registered=["NoWidening"], metrics={"NoWidening/CRPS": 1.0})
++    assert _collect_plan_condition_status(tmp_path) is None
++    assert _blocks(None) is False
++
++
++def test_name_mismatch_is_unresolved_and_never_blocks(tmp_path):
++    """A naming-correspondence failure must not be reported as a scientific one.
++
++    Blocking here would halt every run with a name mismatch — the alarm fatigue
++    that makes a guard get switched off.
++    """
++    _plan(
++        tmp_path,
++        proposed=[("DivergenceConditionedWidening", "ZzzDivergence")],
++        ablations=[("NoWidening", "ZzzNoWidening")],
++    )
++    _refine(
++        tmp_path,
++        "stage-13",
++        registered=["TotallyDifferentName", "AnotherOne"],
++        metrics={"TotallyDifferentName/CRPS": 1.0},
++    )
++    status = _collect_plan_condition_status(tmp_path)
++    assert status["correspondence"] == "unresolved"
++    assert _blocks(status) is False
++
++
++def test_scored_proposed_method_does_not_block(tmp_path):
++    _plan(
++        tmp_path,
++        proposed=[("DivergenceConditionedWidening", "DivergenceConditionedWidener")],
++        ablations=[("NoWidening", "NoWidening")],
++    )
++    _refine(
++        tmp_path,
++        "stage-13",
++        registered=["NoWidening", "DivergenceConditionedWidener"],
++        metrics={"DivergenceConditionedWidener/CRPS": 11.0, "NoWidening/CRPS": 13.0},
++    )
++    status = _collect_plan_condition_status(tmp_path)
++    assert status["any_proposed_method_scored"] is True
++    assert _blocks(status) is False
++
++
++# ---------------------------------------------------------------------------
++# The rollback-archive trap
++# ---------------------------------------------------------------------------
++
++
++def test_reads_the_authoritative_refinement_log_not_the_lexicographic_last(tmp_path):
++    """On rollback the COMPLETED cycle is archived to `stage-13_vN` and the new
++    cycle takes the bare name, so `stage-13` is newest.
++
++    `sorted(glob("stage-13*"))[-1]` returns `stage-13_v2` — lexicographically
++    last, chronologically middle.
++
++    NOTE this fixture is CONSTRUCTED, not a replay. On the real
++    `rc-ws3-h2-real4-20260731` the block decision is *invariant* across all
++    three cycles (`correspondence: ok`, `any_proposed_method_scored: False` in
++    each); only the reported verdict for `UnconditionalQuantileAggregation`
++    varies — `not_registered` in the authoritative cycle vs
++    `registered_not_scored` in `stage-13_v2`, which registered a 6th condition.
++    So on that run the log choice governs the honesty of the message, not the
++    correctness of the block.
++
++    This test pins the stronger property anyway: a run *can* be built where the
++    archived cycle scored the proposed method and the current one did not, and
++    there the wrong log fails to block a paper whose subject never ran in the
++    cycle it is written from. Reading the authoritative log is correct in both
++    regimes; a union is correct in neither.
++    """
++    _plan(
++        tmp_path,
++        proposed=[("DivergenceConditionedWidening", "DivergenceConditionedWidener")],
++        ablations=[("NoWidening", "NoWidening")],
++    )
++    # current cycle (bare name, newest): proposed method did NOT score
++    _refine(
++        tmp_path,
++        "stage-13",
++        registered=["NoWidening", "DivergenceConditionedWidener"],
++        metrics={"NoWidening/CRPS": 139.48},
++    )
++    # archived cycles: one of them DID score the proposed method
++    _refine(
++        tmp_path,
++        "stage-13_v2",
++        registered=["NoWidening", "DivergenceConditionedWidener"],
++        metrics={"DivergenceConditionedWidener/CRPS": 11.0},
++    )
++    _refine(
++        tmp_path,
++        "stage-13_v1",
++        registered=["NoWidening"],
++        metrics={},
++    )
++    status = _collect_plan_condition_status(tmp_path)
++    # Must reflect the CURRENT cycle only — a union would fail open here.
++    assert status["any_proposed_method_scored"] is False
++    assert _blocks(status) is True
++
++
++# ---------------------------------------------------------------------------
++# The real artefact
++# ---------------------------------------------------------------------------
++
++_REAL_RUN = (
++    Path(__file__).resolve().parents[1] / "artifacts" / "rc-ws3-h2-real4-20260731"
++)
++
++
++@pytest.mark.skipif(
++    not (_REAL_RUN / "stage-09" / "exp_plan.yaml").is_file(),
++    reason="reference run not present in this checkout",
++)
++def test_real_run_blocks_and_names_the_fabricated_baseline():
++    status = _collect_plan_condition_status(_REAL_RUN)
++    assert status["correspondence"] == "ok"
++    assert status["declared_count"] == 8
++    assert status["any_proposed_method_scored"] is False
++    assert _blocks(status) is True
++    # The paper's fabricated baseline row was a condition the plan declared and
++    # the code never registered.
++    assert "UnconditionalQuantileAggregation" in status["not_registered"]
+diff --git a/tests/test_results_evidence.py b/tests/test_results_evidence.py
+new file mode 100644
+index 0000000..bf1a199
+--- /dev/null
++++ b/tests/test_results_evidence.py
+@@ -0,0 +1,443 @@
++"""FAB-1: execution-artefact reconciliation must not be defeatable by log text.
++
++Regression tests for the 2026-07-31 fabrication incident, in which run
++``rc-ws3-h2-real4-20260731`` shipped a 27 KB paper of invented numbers from an
++experiment whose only stage-12 run recorded ``status: failed, metrics: {}``.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from researchclaw.pipeline.results_evidence import (
++    ExecutionRecord,
++    collect_results_evidence,
++)
++
++
++def _write(path: Path, payload: dict) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++
++
++def _run(run_dir: Path, name: str, **payload) -> None:
++    _write(run_dir / "stage-12" / "runs" / name, payload)
++
++
++def _refine(run_dir: Path, stage: str, iterations: list[dict]) -> None:
++    _write(run_dir / stage / "refinement_log.json", {"iterations": iterations})
++
++
++# ---------------------------------------------------------------------------
++# The exact incident
++# ---------------------------------------------------------------------------
++
++
++def test_crashed_run_with_condition_progress_lines_is_not_evidence(tmp_path):
++    """The defeated guard: stdout progress messages must not count.
++
++    The real run printed ``Running condition: NoWidening`` and two other
++    ``condition``-bearing lines before dying, which satisfied the old
++    ``>= 3 x condition[=:]`` rule.
++    """
++    _run(
++        tmp_path,
++        "run-1.json",
++        run_id="run-1",
++        status="failed",
++        metrics={},
++        timed_out=False,
++        stdout=(
++            "METRIC_DEF: CRPS, Coverage90\n"
++            "REGISTERED_CONDITIONS: NoWidening, DivergenceConditionedWidener\n"
++            "Running condition: NoWidening\n"
++            "condition=NoWidening seed=0\n"
++            "condition=NoWidening seed=1\n"
++        ),
++        stderr="TypeError: unsupported operand type(s) for *: 'Timestamp' and 'float'",
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.is_authoritative
++    assert ev.has_real_metrics is False
++    assert ev.finite_metric_values == ()
++    assert ev.blocking_reasons()
++
++
++def test_metrics_emitted_before_a_nonzero_exit_are_not_verified(tmp_path):
++    """A returncode=1 sandbox emitted 34 metrics for one condition. Those are
++    the numbers the paper's fabricated table was laundered through."""
++    _run(tmp_path, "run-1.json", status="failed", metrics={}, timed_out=False)
++    _refine(
++        tmp_path,
++        "stage-13",
++        [
++            {
++                "version_dir": "experiment_v1/",
++                "sandbox": {
++                    "returncode": 1,
++                    "timed_out": False,
++                    "metrics": {
++                        "NoWidening/0/CRPS": 707213.5866951895,
++                        "NoWidening/CRPS": 707213.5866951895,
++                        "NoWidening/0/Coverage90": 0.9200945626477541,
++                    },
++                },
++            }
++        ],
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is False
++    assert ev.verified_conditions == ()
++    # The condition is *named* by a failed execution — that is exactly the
++    # trap, so it must be reported as unverified rather than silently dropped.
++    assert ev.unverified_conditions == ("NoWidening",)
++    assert ev.orphan_metric_count == 3
++
++
++# ---------------------------------------------------------------------------
++# No false positives
++# ---------------------------------------------------------------------------
++
++
++def test_clean_exit_with_metrics_is_evidence(tmp_path):
++    _run(
++        tmp_path,
++        "run-1.json",
++        status="completed",
++        metrics={"MethodA/0/CRPS": 12.5, "MethodA/CRPS": 12.5},
++        timed_out=False,
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is True
++    assert ev.verified_conditions == ("MethodA",)
++    assert ev.blocking_reasons() == []
++
++
++def test_refinement_sandbox_returncode_zero_is_evidence(tmp_path):
++    _run(tmp_path, "run-1.json", status="failed", metrics={}, timed_out=False)
++    _refine(
++        tmp_path,
++        "stage-13",
++        [
++            {
++                "version_dir": "experiment_v1/",
++                "sandbox": {"returncode": 1, "timed_out": False, "metrics": {}},
++                "sandbox_after_fix": {
++                    "returncode": 0,
++                    "timed_out": False,
++                    "metrics": {"MethodA/CRPS": 11.2},
++                },
++            }
++        ],
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is True
++    assert ev.verified_conditions == ("MethodA",)
++
++
++def test_timeout_with_metrics_counts_as_degraded_evidence(tmp_path):
++    """A timeout is a budget outcome, not a broken contract."""
++    _run(
++        tmp_path,
++        "run-1.json",
++        status="partial",
++        metrics={"MethodA/CRPS": 9.0},
++        timed_out=True,
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is True
++    assert [e.outcome for e in ev.executions] == ["degraded"]
++
++
++# ---------------------------------------------------------------------------
++# Boundaries
++# ---------------------------------------------------------------------------
++
++
++def test_no_execution_artifacts_is_not_authoritative(tmp_path):
++    """Silence is not absence: with nothing to reconcile against, the module
++    must not assert either way (theoretical domains record no runs)."""
++    (tmp_path / "stage-14").mkdir(parents=True)
++    ev = collect_results_evidence(tmp_path)
++    assert ev.is_authoritative is False
++    assert ev.blocking_reasons() == []
++
++
++def test_simulated_status_is_never_evidence(tmp_path):
++    _run(tmp_path, "run-1.json", status="simulated", metrics={"acc": 0.33})
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is False
++    assert ev.executions[0].outcome == "simulated"
++
++
++def test_clean_exit_with_empty_metrics_is_not_evidence(tmp_path):
++    _run(tmp_path, "run-1.json", status="completed", metrics={}, timed_out=False)
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is False
++
++
++def test_infrastructure_counters_are_not_results(tmp_path):
++    _run(
++        tmp_path,
++        "run-1.json",
++        status="completed",
++        metrics={"elapsed_sec": 12.0, "SEED_COUNT": 3, "total_runs": 1},
++        timed_out=False,
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is False
++
++
++def test_non_finite_and_boolean_values_are_not_results(tmp_path):
++    _run(
++        tmp_path,
++        "run-1.json",
++        status="completed",
++        metrics={"MethodA/CRPS": float("nan"), "converged": True},
++        timed_out=False,
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is False
++
++
++def test_infra_key_match_is_whole_token_not_substring(tmp_path):
++    """``total_runs`` is infrastructure; ``total_runs_recovered`` is not."""
++    _run(
++        tmp_path,
++        "run-1.json",
++        status="completed",
++        metrics={"MethodA/total_runs_recovered": 4.0},
++        timed_out=False,
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is True
++
++
++def test_evidence_does_not_require_the_configured_metric_key(tmp_path):
++    """A `metric_key` mismatch must never read as "no results".
++
++    In `rc-ws3-h2-real4-20260731`, `config.experiment.metric_key` was
++    `primary_metric` while the experiment emitted CRPS / Coverage90 / Width90 /
++    PinballLoss.  `_find_metric` matches on `key in mk`, so no emitted key could
++    ever match and even a perfectly clean run scores `metric_val = None`.
++    This module must key on "any finite non-infra metric", never on the
++    configured metric name, or that mismatch would masquerade as a crash.
++    """
++    _run(
++        tmp_path,
++        "run-1.json",
++        status="completed",
++        metrics={
++            "NoWidening/0/CRPS": 707213.5866951895,
++            "NoWidening/Coverage90": 0.9200945626477541,
++            "NoWidening/PinballLoss": 64.46545339560637,
++        },
++        timed_out=False,
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is True
++    assert ev.verified_conditions == ("NoWidening",)
++    assert len(ev.finite_metric_values) == 3
++
++
++def test_has_real_metrics_is_provenance_not_validity(tmp_path):
++    """Pin the guarantee's boundary so it is never over-quoted.
++
++    The 2026-07-31 baseline evaluator computed `crps = (upper - lower) / 2` —
++    the interval half-width — with `predict()` returning feature columns and no
++    model fitting anything.  Under `metric_key: CRPS` + `minimize`, the argmin
++    of that objective is `lower == upper`: zero-width intervals, coverage 0.
++
++    Such a run terminates cleanly and emits finite numbers, so it PASSES here,
++    and that is correct: the numbers really were produced.  This module
++    certifies provenance, never validity.  Deciding CRPS must be minimised
++    subject to a coverage floor is authoring the experiment's evaluation, which
++    belongs in the experiment plan, not in an integrity gate.
++
++    If this test ever starts failing because someone taught the module to judge
++    plausibility, that is a design change requiring a deliberate decision — not
++    a bug fix.
++    """
++    _run(
++        tmp_path,
++        "run-1.json",
++        status="completed",
++        metrics={
++            "Degenerate/CRPS": 0.0,  # zero-width intervals: the argmin
++            "Degenerate/Width90": 0.0,
++            "Degenerate/Coverage90": 0.0,  # ...and nothing is ever covered
++        },
++        timed_out=False,
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is True
++    assert ev.verified_conditions == ("Degenerate",)
++    assert ev.blocking_reasons() == []
++
++
++def test_unverified_conditions_cannot_see_conditions_that_never_ran(tmp_path):
++    """Pin the field's semantics so it is not misread as "all unsupported".
++
++    `unverified_conditions` can only name conditions that emitted at least one
++    metric key. In the real run, 5 conditions were registered and only
++    `NoWidening` ever emitted anything — so the field reports exactly
++    `("NoWidening",)` while four declared wideners are invisible.
++
++    Reading that as "one condition is questionable" is the mistake this test
++    exists to prevent. Establishing the declared set needs the experiment
++    plan, not the execution record.
++    """
++    _run(
++        tmp_path,
++        "run-1.json",
++        status="failed",
++        metrics={"NoWidening/CRPS": 707213.5866951895},
++        timed_out=False,
++        stdout=(
++            "REGISTERED_CONDITIONS: NoWidening, ShuffledDivergenceWidener, "
++            "DivergenceConditionedWidener, VolatilityConditionedWidener, "
++            "NormalizedConformalWidener\n"
++            "Running condition: NoWidening\n"
++        ),
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is False
++    # Only the condition that emitted something is named...
++    assert ev.unverified_conditions == ("NoWidening",)
++    # ...and the four that never ran are absent, by design, not by accident.
++    for never_ran in (
++        "ShuffledDivergenceWidener",
++        "DivergenceConditionedWidener",
++        "VolatilityConditionedWidener",
++        "NormalizedConformalWidener",
++    ):
++        assert never_ran not in ev.unverified_conditions
++        assert never_ran not in ev.verified_conditions
++
++
++def test_partial_condition_coverage_passes_the_gate(tmp_path):
++    """Pins that THIS module does not judge coverage — FAB-2 does.
++
++    `results_evidence` blocks only when *nothing* ran. A run where 1 of N conditions
++    scored passes, and a paper may then tabulate all N. That is the 2026-07-31
++    incident's own shape, one level up:
++
++        planned 8 (stage-09/exp_plan.yaml)
++          -> registered 5 (stage-12 stdout)
++            -> scored 1 (NoWidening)
++              -> tabulated 5+ in the paper
++
++    Closing it needs the DECLARED set, which lives in the experiment plan, not
++    in the execution record — so it is a separate check with a separate input,
++    not something this module can infer. Match it on
++    `implementation_spec.class_name`, which is exactly what the code registers
++    (5/5 exact on this run); do NOT try to normalise the human-readable `name`
++    field, which is unbridgeable — the same logical condition `NoWidening` maps
++    to `NoWidening`, `FixedIntervalWidener` and `FixedWidthPredictor` across
++    three runs of the same experiment.
++
++    This module must keep passing such a run: its question is provenance.
++    The coverage question is answered one layer up, by the FAB-2 block in
++    `_paper_writing.py` (`tests/test_plan_condition_block.py`), which reads the
++    DECLARED set from `stage-09/exp_plan.yaml` and refuses to draft when no
++    proposed method scored. Keep the separation: if this test ever fails,
++    coverage logic has leaked into the provenance module.
++    """
++    _run(
++        tmp_path,
++        "run-1.json",
++        status="completed",
++        metrics={"NoWidening/CRPS": 139.48, "NoWidening/Coverage90": 0.92},
++        timed_out=False,
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is True  # one condition really did score
++    assert ev.verified_conditions == ("NoWidening",)
++    assert ev.blocking_reasons() == []  # ...and nothing stops a 5-row table
++
++
++def test_missing_returncode_is_unknown_not_success(tmp_path):
++    _refine(
++        tmp_path,
++        "stage-13",
++        [
++            {
++                "version_dir": "experiment_v1/",
++                "sandbox": {"metrics": {"MethodA/CRPS": 3.0}},
++            }
++        ],
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.executions[0].outcome == "unknown"
++    assert ev.has_real_metrics is False
++
++
++def test_unreadable_artifacts_are_skipped(tmp_path):
++    runs = tmp_path / "stage-12" / "runs"
++    runs.mkdir(parents=True)
++    (runs / "run-1.json").write_text("{not json", encoding="utf-8")
++    _run(tmp_path, "run-2.json", status="completed", metrics={"M/CRPS": 1.0})
++    ev = collect_results_evidence(tmp_path)
++    assert ev.has_real_metrics is True
++    assert len(ev.executions) == 1
++
++
++def test_results_json_is_not_treated_as_a_run(tmp_path):
++    runs = tmp_path / "stage-12" / "runs"
++    runs.mkdir(parents=True)
++    (runs / "results.json").write_text(
++        json.dumps({"metrics": {"M/CRPS": 1.0}}), encoding="utf-8"
++    )
++    ev = collect_results_evidence(tmp_path)
++    assert ev.is_authoritative is False
++
++
++def test_to_dict_is_json_serialisable(tmp_path):
++    _run(tmp_path, "run-1.json", status="failed", metrics={}, timed_out=False)
++    payload = collect_results_evidence(tmp_path).to_dict()
++    json.dumps(payload)
++    assert payload["has_real_metrics"] is False
++    assert payload["executions_examined"] == 1
++
++
++@pytest.mark.parametrize(
++    "outcome,values,expected",
++    [
++        ("success", (1.0,), True),
++        ("degraded", (1.0,), True),
++        ("success", (), False),
++        ("failed", (1.0,), False),
++        ("simulated", (1.0,), False),
++        ("unknown", (1.0,), False),
++    ],
++)
++def test_is_evidence_matrix(outcome, values, expected):
++    rec = ExecutionRecord(
++        source="s", kind="run", outcome=outcome, detail="", metric_values=values
++    )
++    assert rec.is_evidence is expected
++
++
++# ---------------------------------------------------------------------------
++# The real artefact, when it is present
++# ---------------------------------------------------------------------------
++
++_REAL_RUN = (
++    Path(__file__).resolve().parents[1] / "artifacts" / "rc-ws3-h2-real4-20260731"
++)
++
++
++@pytest.mark.skipif(
++    not (_REAL_RUN / "stage-12" / "runs" / "run-1.json").is_file(),
++    reason="fabricated reference run not present in this checkout",
++)
++def test_real_fabricated_run_is_blocked():
++    ev = collect_results_evidence(_REAL_RUN)
++    assert ev.is_authoritative is True
++    assert ev.has_real_metrics is False
++    assert ev.verified_conditions == ()
++    assert "NoWidening" in ev.unverified_conditions
++    assert ev.orphan_metric_count > 0

@@ -379,6 +379,15 @@ def _execute_quality_gate(
     revised = _read_prior_artifact(run_dir, "paper_revised.md") or ""
     report: dict[str, Any] | None = None
 
+    # FAB-1: Reconcile against the EXECUTION artefacts first.  A verifier that
+    # reads its answer out of the artefact it is verifying (the paper text) or
+    # out of a summary derived from a crashed process is not a verifier.
+    from researchclaw.pipeline.results_evidence import (
+        collect_results_evidence as _collect_results_evidence,
+    )
+    _evidence = _collect_results_evidence(run_dir)
+    _no_results = _evidence.is_authoritative and not _evidence.has_real_metrics
+
     # BUG-25 + BUG-180: Load the RICHEST experiment summary for cross-checking.
     # _read_prior_artifact returns the first match in reverse-sorted order,
     # which may be a repair stage with 0 conditions.  Instead, scan all
@@ -431,6 +440,13 @@ def _execute_quality_gate(
         # BUG-180: If we found real condition data, don't mark as failed
         if _best_richness > 0:
             _exp_failed = False
+
+    # FAB-1: condition_summaries can be populated from a process that exited
+    # non-zero (see _analysis.py, which stamps status "completed" on refinement
+    # metrics regardless of returncode).  The execution artefacts override every
+    # heuristic above, in both directions.
+    if _evidence.is_authoritative:
+        _exp_failed = _no_results
 
     if llm is not None:
         _pm = prompts or PromptManager()
@@ -496,9 +512,27 @@ def _execute_quality_gate(
             )
     if report is None:
         report = _default_quality_report(config.research.quality_threshold)
+    # FAB-1: "Accept" is impossible when no condition produced a finite metric.
+    # This is not a cap on an LLM opinion — it is an arithmetic fact about the
+    # run directory, so it overrides the model's verdict outright.
+    if _no_results:
+        report["score_1_to_10"] = 1.0
+        report["verdict"] = "reject"
+        report["fabrication_block"] = True
+        report.setdefault("weaknesses", []).insert(
+            0,
+            "FAB-1: no experiment execution produced a finite metric value — "
+            "every numerical result in this paper is unsupported by any "
+            "artefact. See stage-20/results_evidence.json.",
+        )
+        logger.error(
+            "FAB-1: QUALITY GATE forced to reject — no execution produced a "
+            "finite metric.\n%s",
+            "\n".join(_evidence.blocking_reasons()),
+        )
     report.setdefault("generated", _utcnow_iso())
-    (stage_dir / "quality_report.json").write_text(
-        json.dumps(report, indent=2), encoding="utf-8"
+    (stage_dir / "results_evidence.json").write_text(
+        json.dumps(_evidence.to_dict(), indent=2), encoding="utf-8"
     )
 
     # T2.1: Enforce quality gate — fail if score below threshold
@@ -551,6 +585,26 @@ def _execute_quality_gate(
     _fabrication_info["fabrication_suspected"] = (
         _exp_failed and not _fabrication_info["has_real_data"]
     )
+    # FAB-1: everything above is derived from experiment_summary.json, which a
+    # crashed process can populate.  Reconcile it against the execution record:
+    # if no process terminated with results then there IS no real data, and any
+    # number in the paper is fabricated — regardless of what the summary says.
+    if _evidence.is_authoritative:
+        _fabrication_info["evidence"] = _evidence.to_dict()
+        _fabrication_info["summary_derived_values"] = list(
+            _fabrication_info["real_metric_values"]
+        )
+        _fabrication_info["real_metric_values"] = [
+            round(v, 4) for v in _evidence.finite_metric_values
+        ]
+        _fabrication_info["has_real_data"] = _evidence.has_real_metrics
+        _fabrication_info["fabrication_suspected"] = _no_results
+        _fabrication_info["experiment_failed"] = _exp_failed
+        _fabrication_info["unverified_conditions"] = list(
+            _evidence.unverified_conditions
+        )
+        if _no_results:
+            _fabrication_info["blocking_reasons"] = _evidence.blocking_reasons()
     # Phase 1: Enhanced fabrication detection via VerifiedRegistry
     # BUG-108: Also pass refinement_log so NaN best_metric is properly handled
     _rl20_candidates = sorted(run_dir.glob("stage-13*/refinement_log.json"), reverse=True)
@@ -565,13 +619,71 @@ def _execute_quality_gate(
         from researchclaw.pipeline.verified_registry import VerifiedRegistry as _VR20
         _vr20 = _VR20.from_run_dir(run_dir, metric_direction=config.experiment.metric_direction, best_only=True) if isinstance(_exp_summary, dict) else None
         if _vr20:
+            _fabrication_info["registry_values_count"] = len(_vr20.values)
+            _fabrication_info["registry_conditions"] = sorted(_vr20.condition_names)
             _fabrication_info["verified_values_count"] = len(_vr20.values)
             _fabrication_info["verified_conditions"] = sorted(_vr20.condition_names)
     except Exception:
         pass
+    # FAB-1: The VerifiedRegistry is built from experiment_summary.json, so its
+    # counts inherit that artefact's laundering.  "Verified" must mean traced to
+    # an execution that terminated with results — nothing else.
+    if _evidence.is_authoritative:
+        _fabrication_info["verified_values_count"] = len(
+            _evidence.finite_metric_values
+        )
+        _fabrication_info["verified_conditions"] = list(
+            _evidence.verified_conditions
+        )
     (stage_dir / "fabrication_flags.json").write_text(
         json.dumps(_fabrication_info, indent=2), encoding="utf-8"
     )
+
+    # FAB-1: A paper cannot be "Accept"ed while its own fabrication flag is
+    # raised.  This also covers runs with NO execution artefacts at all, where
+    # the evidence module deliberately stays silent: the LLM's verdict used to
+    # survive alongside `fabrication_suspected: true`.
+    if _fabrication_info.get("fabrication_suspected") and str(
+        report.get("verdict", "")
+    ).strip().lower() in ("accept", "accepted", "proceed"):
+        logger.error(
+            "FAB-1: downgrading verdict %r to 'revise' — fabrication_suspected "
+            "is set (has_real_data=%s)",
+            report.get("verdict"),
+            _fabrication_info.get("has_real_data"),
+        )
+        report["verdict"] = "revise"
+        report["verdict_downgraded_by"] = "FAB-1 fabrication_suspected"
+        report.setdefault("weaknesses", []).insert(
+            0,
+            "FAB-1: fabrication suspected — no verified metric values back the "
+            "reported results; 'Accept' is not available.",
+        )
+        verdict = report["verdict"]
+    (stage_dir / "quality_report.json").write_text(
+        json.dumps(report, indent=2), encoding="utf-8"
+    )
+
+    # FAB-1: A fabrication block is not degradable.  graceful_degradation exists
+    # to let a merely-weak paper through; it must never launder a paper whose
+    # numbers have no source.
+    if _no_results:
+        return StageResult(
+            stage=Stage.QUALITY_GATE,
+            status=StageStatus.FAILED,
+            artifacts=(
+                "quality_report.json",
+                "fabrication_flags.json",
+                "results_evidence.json",
+            ),
+            evidence_refs=("stage-20/results_evidence.json",),
+            decision="fabrication_block",
+            error=(
+                "FAB-1: no experiment execution produced a finite metric — "
+                "reported results are unsupported by any artefact "
+                "(see stage-20/results_evidence.json)"
+            ),
+        )
 
     if isinstance(score, (int, float)) and score < threshold:
         if config.research.graceful_degradation:
